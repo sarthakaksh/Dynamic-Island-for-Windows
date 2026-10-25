@@ -97,7 +97,7 @@ The Dynamic Island intelligently expands to display context-aware dashboards. Yo
 - Suggestions for UI/UX or new integrations are always welcome.
 
 ### Credits
-- **[Sarthak Singh (sarthakaksh) @GitHub](https://github.com/sarthakaksh)**: Major feature overhaul including smoothing animations, right-click focus timer, lyrics for songs, quick lookup, Cross-Source Media Switching, hover clock, robust media controls, zero-CPU instant hide shortcut, Bluetooth battery integration, image clipboard thumbnails, and full-screen autohide fixes.
+- **[Sarthak Singh (sarthakaksh) @GitHub](https://github.com/sarthakaksh)**: Major feature overhaul including smoothing animations, right-click focus timer, strip mode, lyrics for songs, quick lookup, Cross-Source Media Switching, hover clock, robust media controls, zero-CPU instant hide shortcut, Bluetooth battery integration, image clipboard thumbnails, and full-screen autohide fixes.
 - **[ciizerr @GitHub](https://github.com/ciizerr)**: Improved the UI by refining layout alignment, fixing dashboard scaling, and enhancing calendar and weather module integration.
 - **[ChrisSch-dev @GitHub](https://github.com/ChrisSch-dev)**: Added album title support, word wrapping for weather descriptions, sleep resume fixes, and various performance/movement stability improvements.
 - **[thevioletto @GitHub](https://github.com/thevioletto)**: Added custom font support, Windows Do Not Disturb integration and status alerts, improved album art color sampling, reorganized settings, and addressed various UI/media edge cases.
@@ -159,6 +159,18 @@ We love community contributions! To ensure high-quality updates, please follow t
       - default: Default (Apple Pill)
       - w11: Windows 11 (Rounded Box)
       - notch: macOS Notch (Top Edge Flush)
+  - StripMode: false
+    $name: Strip mode
+    $description: Rests the island as a thin strip that uses almost no resources. Hover over it to open the island in the shape chosen above. Also available in the right-click menu under Shape style.
+  - StripSensitivity: medium
+    $name: Strip mode hover sensitivity
+    $description: How close the cursor has to get to the strip before the island opens. Minimum means the cursor must be exactly on the strip. Maximum opens it as soon as the cursor comes near. Medium is the default. Only used when Strip mode is on.
+    $options:
+      - minimum: Minimum - exactly on the strip
+      - low: Low
+      - medium: Medium (Default)
+      - high: High
+      - maximum: Maximum - opens when the cursor is near
   - ProgressStyle: slim
     $name: Progress bar style
     $description: Look of the song progress bar in the expanded media player. Wavy and Squiggle animate while music is playing and flatten when paused.
@@ -962,6 +974,26 @@ struct MediaContentPoint {
 
 // The conversion and hit-test helpers live further down, just after Clamp().
 
+// Strip mode: the island rests as a thin strip and opens on hover.
+namespace StripModeLayout {
+    constexpr float kWidth = 64.0f;          // content px, multiplied by sizeScale
+    constexpr float kHeight = 5.0f;
+    constexpr float kHoverPadX = 24.0f;      // hover zone at Medium sensitivity: a 5px strip is hard to hit
+    constexpr float kHoverPadY = 14.0f;
+
+    // Multiplier on the Medium hover zone for each sensitivity level
+    // (0 = Minimum, 1 = Low, 2 = Medium, 3 = High, 4 = Maximum).
+    constexpr float HoverPadScale(int level) {
+        return level <= 0 ? 0.0f
+             : level == 1 ? 0.4f
+             : level == 2 ? 1.0f
+             : level == 3 ? 2.2f
+                          : 4.0f;
+    }
+    constexpr float kContentFadeStart = 10.0f;  // content is invisible below this height
+    constexpr float kContentFadeSpan = 22.0f;   // and fully visible above start + span
+}
+
 enum class IslandKind {
     Idle,
     Media,
@@ -1224,6 +1256,8 @@ struct Settings {
     bool autoDpiScale = true;
     bool w11Style = false;
     bool notchStyle = false;
+    bool stripMode = false;  // thin resting strip, opens on hover (independent of the shape)
+    int stripSensitivity = 2;  // 0 = Minimum, 1 = Low, 2 = Medium, 3 = High, 4 = Maximum
     // Color customization
     ThemePreset themePreset = ThemePreset::Obsidian;
     D2D1_COLOR_F pillBgColor = D2D1::ColorF(0.031f, 0.031f, 0.039f, 1.0f); // #08080A
@@ -3285,6 +3319,30 @@ void LoadSettings() {
     // A bottom-anchored island cannot be a top-edge macOS notch.
     if (IsBottomPosition(next.position)) {
         next.notchStyle = false;
+    }
+
+    // Strip mode: right-click choice wins until the Mod Settings value is changed.
+    {
+        const int stripSetting = Wh_GetIntSetting(L"Appearance.StripMode") != 0 ? 1 : 0;
+        int stripOverride = Wh_GetIntValue(L"StripModeOverride", -1);
+        if (stripOverride >= 0 && Wh_GetIntValue(L"StripModeOverrideBase", -1) != stripSetting) {
+            Wh_SetIntValue(L"StripModeOverride", -1);
+            stripOverride = -1;
+        }
+        next.stripMode = stripOverride >= 0 ? (stripOverride != 0) : (stripSetting != 0);
+
+        const std::wstring stripSens = GetStringSettingCopy(L"Appearance.StripSensitivity");
+        if (EqualsNoCase(stripSens, L"minimum")) {
+            next.stripSensitivity = 0;
+        } else if (EqualsNoCase(stripSens, L"low")) {
+            next.stripSensitivity = 1;
+        } else if (EqualsNoCase(stripSens, L"high")) {
+            next.stripSensitivity = 3;
+        } else if (EqualsNoCase(stripSens, L"maximum")) {
+            next.stripSensitivity = 4;
+        } else {
+            next.stripSensitivity = 2;
+        }
     }
 
     // Color settings — check local theme override first, then settings YAML.
@@ -11396,6 +11454,10 @@ void ShowContextMenu(HWND hwnd, POINT screenPoint) {
         }
         CheckMenuRadioItem(shapeMenu, kShapeMenuIdBase, kShapeMenuIdBase + 2,
                            kShapeMenuIdBase + static_cast<UINT>(currentShape), MF_BYCOMMAND);
+        // Strip mode is a plain on/off toggle, not one of the three shapes.
+        AppendMenuW(shapeMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(shapeMenu, MF_STRING | (g_settings.stripMode ? MF_CHECKED : 0),
+                    kShapeMenuIdBase + 3, L"Strip mode");
         AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(shapeMenu), L"Shape style");
     }
     const int activeExpandOnHover = Wh_GetIntValue(L"ExpandOnHoverOverride", -1) >= 0
@@ -11602,6 +11664,14 @@ void ShowContextMenu(HWND hwnd, POINT screenPoint) {
             LoadSettings();
             g_layoutDirty = true;
             TriggerNudge();
+            break;
+        }
+        case kShapeMenuIdBase + 3: {
+            const int stripSetting = Wh_GetIntSetting(L"Appearance.StripMode") != 0 ? 1 : 0;
+            Wh_SetIntValue(L"StripModeOverride", g_settings.stripMode ? 0 : 1);
+            Wh_SetIntValue(L"StripModeOverrideBase", stripSetting);
+            LoadSettings();
+            g_layoutDirty = true;
             break;
         }
         case 11: {
@@ -12875,12 +12945,25 @@ class Renderer {
         } else if (!settings.w11Style) {
             radius = std::min(radius, 44.0f * settings.sizeScale);
         }
+        // A radius larger than half the height breaks on a thin strip.
+        radius = std::min(radius, std::min(w, h) * 0.5f);
+
+        // Strip mode: content fades in as the island grows out of the strip.
+        const float contentAlpha = settings.stripMode
+            ? SmoothStep01((h / std::max(0.05f, settings.sizeScale) - StripModeLayout::kContentFadeStart) /
+                           StripModeLayout::kContentFadeSpan)
+            : 1.0f;
         if (pillCount_ < DwmBackdrop::kMaxPills) {
             pillRects_[pillCount_] = rect;
             pillRadii_[pillCount_] = radius;
             ++pillCount_;
         }
-        DrawSoftShadow(rect, radius);
+        if (contentAlpha > 0.01f) {
+            const float savedOpacity = settingsOpacity_;
+            settingsOpacity_ = savedOpacity * contentAlpha;
+            DrawSoftShadow(rect, radius);
+            settingsOpacity_ = savedOpacity;
+        }
 
         DrawPillSurface(rect, radius, activity.kind, settings);
 
@@ -12910,7 +12993,21 @@ class Renderer {
         float unH = (rect.bottom - rect.top) * invScale;
         D2D1_RECT_F unscaledRect = D2D1::RectF(pillCenter.x - unW * 0.5f, pillCenter.y - unH * 0.5f, pillCenter.x + unW * 0.5f, pillCenter.y + unH * 0.5f);
 
-        switch (activity.kind) {
+        // The strip itself draws no content; it fades in while the island opens.
+        const bool drawContent = contentAlpha > 0.01f;
+        ID2D1Layer* stripFadeLayer = nullptr;
+        if (drawContent && contentAlpha < 0.995f) {
+            stripFadeLayer = AcquireLayer();
+            if (stripFadeLayer) {
+                target_->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
+                                                          D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                                          D2D1::IdentityMatrix(), contentAlpha, nullptr,
+                                                          D2D1_LAYER_OPTIONS_NONE),
+                                   stripFadeLayer);
+            }
+        }
+
+        if (drawContent) switch (activity.kind) {
             case IslandKind::Media:
                 DrawMedia(state, unscaledRect, settings, now);
                 break;
@@ -12959,7 +13056,12 @@ class Renderer {
         // ── Apple-style privacy indicator dots ───────────────────────────────
         // Green dot = camera in use, Orange dot = mic in use.
         // Drawn in top-right corner of pill, outside content area.
-        DrawPrivacyDots(state, settings, unscaledRect, now);
+        if (drawContent) {
+            DrawPrivacyDots(state, settings, unscaledRect, now);
+        }
+        if (stripFadeLayer) {
+            target_->PopLayer();
+        }
 
         target_->SetTransform(oldTransform);
     }
@@ -23499,7 +23601,8 @@ DWORD WINAPI RenderThreadProc(void*) {
         const bool pinned = g_pinnedExpanded.load();
 
         if (primary.kind != previousPrimary) {
-            if (primary.kind != IslandKind::Idle) {
+            if (primary.kind != IslandKind::Idle &&
+                !(g_settings.stripMode && primary.kind == IslandKind::Media)) {
                 nudgeSpring.value = -6.0f;
                 nudgeSpring.velocity = 0.0f;
                 nudgeSpring.target = 0.0f;
@@ -23527,7 +23630,22 @@ DWORD WINAPI RenderThreadProc(void*) {
 
         bool hover = false;
         if (widthSpring.value > 1.0f && heightSpring.value > 1.0f) {
-            hover = PtInRect(&pillRect, cursor) != FALSE;
+            RECT hoverRect = pillRect;
+            if (g_settings.stripMode) {
+                // Padding follows the chosen sensitivity while the island is still strip-sized,
+                // and eases back to the Medium margin as it opens so it can't flicker shut mid-expand.
+                const float stripH = StripModeLayout::kHeight * g_settings.sizeScale;
+                const float openH = MediaLayout::kExpandedHeight * g_settings.sizeScale;
+                const float openT = Clamp((heightSpring.value - stripH) / std::max(1.0f, openH - stripH), 0.0f, 1.0f);
+                const float padMul = StripModeLayout::HoverPadScale(g_settings.stripSensitivity) * (1.0f - openT) + openT;
+                const int padX = static_cast<int>(std::lround(StripModeLayout::kHoverPadX * g_settings.sizeScale * padMul));
+                const int padY = static_cast<int>(std::lround(StripModeLayout::kHoverPadY * g_settings.sizeScale * padMul));
+                hoverRect.left -= padX;
+                hoverRect.right += padX;
+                hoverRect.top -= padY;
+                hoverRect.bottom += padY;
+            }
+            hover = PtInRect(&hoverRect, cursor) != FALSE;
         } else if (g_settings.unhideOnHover) {
             RECT dockRect = GetIslandDockRect();
             hover = PtInRect(&dockRect, cursor) != FALSE;
@@ -23641,6 +23759,10 @@ DWORD WINAPI RenderThreadProc(void*) {
         const bool camIndicatorActive = snapshot.system.cameraActive && g_settings.privacyDots && g_settings.privacyDotsCam;
         const bool privacyActive = micIndicatorActive || camIndicatorActive;
 
+        // Strip mode: rest as a thin strip unless something needs the full island.
+        const bool stripActive = g_settings.stripMode && !hover && !pinned && !isTransientAlert &&
+                                 !privacyActive && !snapshot.timer.justFinished;
+
         // Whether any surface that actually draws CPU / RAM / disk / GPU / network
         // figures is on screen: the in-game overlay, or the idle dashboard's
         // Hardware Monitor tab while expanded (hovered or pinned) and scrolled into
@@ -23653,7 +23775,7 @@ DWORD WINAPI RenderThreadProc(void*) {
         const bool onHardwareMonitorTab = (metricTabIdx == HardwareMonitorTabIndex(g_settings));
         const bool hwMonitorVisible = (primary.kind == IslandKind::Idle || primary.kind == IslandKind::Media) &&
             !isFullscreen && !gameMetricsPresent && (pinned || isHoverExpanded) && onHardwareMonitorTab;
-        const bool gameOverlayVisible = gameMetricsPresent && !isFullscreen;
+        const bool gameOverlayVisible = gameMetricsPresent && !isFullscreen && !stripActive;
         const bool systemMetricsVisible = hwMonitorVisible || gameOverlayVisible;
 
         if (g_settings.brightness && !pollBusy && now >= nextBrightnessPoll) {
@@ -23661,7 +23783,7 @@ DWORD WINAPI RenderThreadProc(void*) {
             nextBrightnessPoll = now + 0.25;
         }
 
-        if (!pollBusy && now >= nextSystemPoll) {
+        if (!pollBusy && !stripActive && now >= nextSystemPoll) {
             const bool needGpuStats = gameOverlayVisible || hwMonitorVisible;
             const bool needNetStats = hwMonitorVisible;  // net is only ever drawn in the HW dashboard
 
@@ -23733,6 +23855,12 @@ DWORD WINAPI RenderThreadProc(void*) {
             }
         }
 
+        if (stripActive && primary.width > 0.0f) {
+            primary.width = StripModeLayout::kWidth * g_settings.sizeScale;
+            primary.height = StripModeLayout::kHeight * g_settings.sizeScale;
+            secondary.reset();
+        }
+
         const bool fullscreenSuppressed =
             isFullscreen && !g_fullscreenOverrideVisible.load(std::memory_order_relaxed);
         if ((isHidden || fullscreenSuppressed) && !privacyActive && !pinned && !isHoverExpanded && !isTransientAlert) {
@@ -23742,7 +23870,7 @@ DWORD WINAPI RenderThreadProc(void*) {
         }
 
         const bool mediaWaveformVisible =
-            g_settings.media && snapshot.media.playing &&
+            g_settings.media && snapshot.media.playing && !stripActive &&
             ((primary.kind == IslandKind::Media && primary.width > 1.0f && primary.height > 1.0f) ||
              (secondary && secondary->kind == IslandKind::Media && secondary->width > 1.0f && secondary->height > 1.0f));
         g_audioCaptureNeeded.store(mediaWaveformVisible, std::memory_order_relaxed);
@@ -23839,7 +23967,8 @@ DWORD WINAPI RenderThreadProc(void*) {
         const bool ctrlHeld = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         const bool ctrlHoverCT = hover && ctrlHeld && !g_lookupUi.open;
 
-        SetClickThrough(hwnd, (primary.kind == IslandKind::Idle && !draggingOrHover && !pinned) || ctrlHoverCT);
+        SetClickThrough(hwnd, (primary.kind == IslandKind::Idle && !draggingOrHover && !pinned) ||
+                                  stripActive || ctrlHoverCT);
 
         // Check if animating structurally
         if (std::abs(widthSpring.velocity) > 0.01f || std::abs(widthSpring.target - widthSpring.value) > 0.01f ||
@@ -23940,7 +24069,7 @@ DWORD WINAPI RenderThreadProc(void*) {
         const bool mediaShown = primary.kind == IslandKind::Media ||
                                 (secondary && secondary->kind == IslandKind::Media);
         const bool mediaAnimating =
-            mediaShown && (snapshot.media.playing || isHoverExpanded || pinned);
+            mediaShown && !stripActive && (snapshot.media.playing || isHoverExpanded || pinned);
 
         // Transient alert pills. All expire within a few seconds, so treating them as
         // continuous cannot run away.
@@ -23973,9 +24102,9 @@ DWORD WINAPI RenderThreadProc(void*) {
 
         // Idle dashboard clock changes once a minute
         static SYSTEMTIME prevTime = {};
-        const bool clockOnScreen =
-            primary.kind == IslandKind::Idle ||
-            (primary.kind == IslandKind::Media && g_settings.mediaPillClock);
+        const bool clockOnScreen = !stripActive &&
+            (primary.kind == IslandKind::Idle ||
+             (primary.kind == IslandKind::Media && g_settings.mediaPillClock));
         if (clockOnScreen && !isHidden) {
             SYSTEMTIME local = {};
             GetLocalTime(&local);
@@ -24004,7 +24133,7 @@ DWORD WINAPI RenderThreadProc(void*) {
         int shownSecond = -1;
         const bool timerShown = primary.kind == IslandKind::Timer ||
                                (secondary && secondary->kind == IslandKind::Timer);
-        if (timerShown && snapshot.timer.running) {
+        if (timerShown && !stripActive && snapshot.timer.running) {
             shownSecond = static_cast<int>(std::ceil(snapshot.timer.endsAt - now));
         } else if (clockOnScreen && g_settings.showSeconds && !isHidden) {
             SYSTEMTIME st = {};
@@ -24184,9 +24313,8 @@ DWORD WINAPI RenderThreadProc(void*) {
 
         if (!needsRender) {
             // Nothing changed on screen, so poll at ~60Hz rather than the target
-            // frame rate. Accuracy does not matter here -- this is a poll interval,
-            // not frame pacing -- so it runs at whatever resolution is in effect.
-            WaitForSingleObject(g_stopEvent, 16);
+            // frame rate. A settled strip only needs to notice the cursor, so ~20Hz.
+            WaitForSingleObject(g_stopEvent, (stripActive && !springsAnimating) ? 50 : 16);
             nextFrameTarget = std::chrono::steady_clock::now();
         } else if (springsAnimating && g_settings.targetFps <= 0 && SUCCEEDED(DwmFlush())) {
             // Auto FPS while the island is resizing: block until DWM's next
