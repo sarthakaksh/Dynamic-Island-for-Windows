@@ -116,6 +116,9 @@ We love community contributions! To ensure high-quality updates, please follow t
 // ==WindhawkModSettings==
 /*
 - Appearance:
+  - CompanionEyes: true
+    $name: Interactive Cyber Eyes
+    $description: Displays animated glowing eyes in the island that track your mouse.
   - Position: top-center
     $name: Position
     $description: Where the island should appear on your screen.
@@ -1249,13 +1252,14 @@ struct Settings {
     bool mediaTabLyrics = false;   // lyrics side panel in the expanded media tab
     int autoHideIdleSeconds = 0;
     bool autoHideFullscreen = true;
-    bool borderMergedMode = false;
+    bool borderMergedMode = true;
     bool unhideOnHover = true;
     bool alwaysOnTop = true;
     bool expandOnHover = true;
     bool autoDpiScale = true;
     bool w11Style = false;
-    bool notchStyle = false;
+    bool notchStyle = true;
+    bool companionEyes = true;
     bool stripMode = false;  // thin resting strip, opens on hover (independent of the shape)
     int stripSensitivity = 2;  // 0 = Minimum, 1 = Low, 2 = Medium, 3 = High, 4 = Maximum
     // Color customization
@@ -1263,8 +1267,8 @@ struct Settings {
     D2D1_COLOR_F pillBgColor = D2D1::ColorF(0.031f, 0.031f, 0.039f, 1.0f); // #08080A
     D2D1_COLOR_F textPrimaryColor = D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f); // #FFFFFF
     D2D1_COLOR_F textSecondaryColor = D2D1::ColorF(0.608f, 0.608f, 0.647f, 1.0f); // #9B9BA5
-    ContourBorderMode contourBorderMode = ContourBorderMode::Default;
-    bool contourBorderEnabled = true;
+    ContourBorderMode contourBorderMode = ContourBorderMode::Borderless;
+    bool contourBorderEnabled = false;
     D2D1_COLOR_F contourBorderColor = D2D1::ColorF(0.200f, 0.200f, 0.220f, 1.0f); // #333338
     bool clockAccentGlow = true;
     bool privacyDotsEnabled = true;
@@ -3323,13 +3327,20 @@ void LoadSettings() {
         Wh_SetIntValue(L"NotchStyleOverride", -1);
     }
     bool baseW11 = EqualsNoCase(shapeStr, L"w11");
-    bool baseNotch = EqualsNoCase(shapeStr, L"notch");
+    bool baseNotch = shapeStr.empty() ? true : EqualsNoCase(shapeStr, L"notch");
 
     const int localW11Style = Wh_GetIntValue(L"W11StyleOverride", -1);
     next.w11Style = localW11Style >= 0 ? (localW11Style != 0) : baseW11;
 
     const int localNotchStyle = Wh_GetIntValue(L"NotchStyleOverride", -1);
     next.notchStyle = localNotchStyle >= 0 ? (localNotchStyle != 0) : baseNotch;
+
+    const int localEyes = Wh_GetIntValue(L"CompanionEyesOverride", -1);
+    next.companionEyes = localEyes >= 0 ? (localEyes != 0) : (Wh_GetIntSetting(L"Appearance.CompanionEyes") != 0 || localEyes == -1);
+
+    if (next.companionEyes || next.notchStyle) {
+        next.borderMergedMode = true;
+    }
 
     // A bottom-anchored island cannot be a top-edge macOS notch.
     if (IsBottomPosition(next.position)) {
@@ -4120,7 +4131,7 @@ int ResolveOffsetY(float windowHeight) {
 // wobble ~1px while its width animated.
 POINT ComputeOverlayOrigin(int height, float pillWidth, float* subX) {
     RECT work = GetAnchorWorkRect();
-    const bool flushTop = g_settings.notchStyle || g_settings.borderMergedMode;
+    const bool flushTop = g_settings.notchStyle || g_settings.borderMergedMode || (g_settings.companionEyes && !IsBottomPosition(g_settings.position));
     const float workW = static_cast<float>(work.right - work.left);
 
     float pillLeft = work.left + (workW - pillWidth) * 0.5f;
@@ -4194,7 +4205,7 @@ inline bool UsesFixedStage(const Settings&) {
 
 StageLayout ComputeStageLayout(const Settings& settings, float pillW, float pillH) {
     StageLayout s;
-    const bool flushTop = settings.notchStyle || settings.borderMergedMode;
+    const bool flushTop = settings.notchStyle || settings.borderMergedMode || (settings.companionEyes && !IsBottomPosition(settings.position));
     pillW = std::max(pillW, 0.0f);
 
     if (!UsesFixedStage(settings)) {
@@ -4368,7 +4379,7 @@ RECT GetIslandDockRect() {
     const float scale = g_settings.sizeScale;
     const int dockWidth = static_cast<int>(std::max(280.0f, 340.0f * scale));
     const int dockHeight = static_cast<int>(std::max(48.0f, 56.0f * scale));
-    const bool flushTop = g_settings.notchStyle || g_settings.borderMergedMode;
+    const bool flushTop = g_settings.notchStyle || g_settings.borderMergedMode || (g_settings.companionEyes && !IsBottomPosition(g_settings.position));
 
     int x = work.left + (work.right - work.left - dockWidth) / 2;
     int y = flushTop ? work.top : (work.top + 8);
@@ -11948,6 +11959,49 @@ struct CollapsedLyricLine {
     bool isTitle = false;  // true when this is the media-title fallback, not a lyric line
 };
 
+struct CompanionEyesState {
+    float lookX = 0.0f;
+    float lookY = 0.0f;
+    double nextBlinkTime = 0.0;
+    double blinkStartTime = 0.0;
+    float hoverHappy = 0.0f;
+
+    // 1. Dizzy Roll
+    POINT prevMousePt = {};
+    double lastMouseCheck = 0.0;
+    float shakeAccum = 0.0f;
+    double lastShakeDirChange = 0.0;
+    float lastMouseDx = 0.0f;
+    float lastMouseDy = 0.0f;
+    double dizzyEndTime = 0.0;
+
+    // 2. Typing Peek
+    double lastTypingTime = 0.0;
+
+    // 4. Sleepy / Drowsy Mode
+    double wakeSurpriseStartTime = 0.0;
+    bool wasSleepy = false;
+
+    // 5. Deep Sleep after 10s idle (snoring & drooling)
+    bool isDeepSleeping = false;
+    double sleepStartTime = 0.0;
+    DWORD prevInputTick = 0;
+
+    // 6. Wakeup Shock & Angry Grumpy sequence
+    double startledEndTime = 0.0;
+    double angryEndTime = 0.0;
+
+    // 7. Happy Charging
+    bool prevCharging = false;
+    double happyChargingEndTime = 0.0;
+
+    // 8. Fluid Jelly spring factor
+    float jellyFlex = 0.0f;
+    float jellyVelocity = 0.0f;
+    float prevWidth = 0.0f;
+};
+inline CompanionEyesState g_companionEyes;
+
 class Renderer {
    public:
     bool Initialize(HWND hwnd) {
@@ -12000,7 +12054,7 @@ class Renderer {
         const int pixelWidth = stage.width;
         const int pixelHeight = stage.height;
 
-        const bool flushTop = settings.notchStyle || settings.borderMergedMode;
+        const bool flushTop = settings.notchStyle || settings.borderMergedMode || (settings.companionEyes && !IsBottomPosition(settings.position));
         const float top = stage.pillTop + (flushTop ? std::max(0.0f, nudge) : nudge);
         const float left = stage.pillLeft;
 
@@ -12081,6 +12135,7 @@ class Renderer {
         const float hoverScale = (settings.expandOnHover && ((hover && !gameMetricsPresent) || pinned)) ? 1.025f : 1.0f;
         const float scale = hoverScale;
         hoverScale_ = scale;
+        hover_ = hover;
 
 
         if (width >= 2.0f && height >= 2.0f) {
@@ -12090,7 +12145,7 @@ class Renderer {
                 // Notch / border-merged islands hang from the top edge, so the
                 // shorter pill stays flush with it instead of being centred
                 // inside the taller one's height (which pushed it down).
-                const bool hangFromTop = settings.notchStyle || settings.borderMergedMode;
+                const bool hangFromTop = settings.notchStyle || settings.borderMergedMode || (settings.companionEyes && !IsBottomPosition(settings.position));
                 const float pTop = hangFromTop ? top : top + (maxH - primary.height) * 0.5f;
                 const float sTop = hangFromTop ? top : top + (maxH - secondary->height) * 0.5f;
 
@@ -12952,10 +13007,16 @@ class Renderer {
         const float cy = (rect.top + rect.bottom) * 0.5f;
         const float w = (rect.right - rect.left) * scale;
         const float h = (rect.bottom - rect.top) * scale;
-        rect = D2D1::RectF(cx - w * 0.5f, cy - h * 0.5f, cx + w * 0.5f, cy + h * 0.5f);
+
+        const bool useNotchShape = settings.notchStyle || (settings.companionEyes && !IsBottomPosition(settings.position));
+        if (useNotchShape) {
+            rect = D2D1::RectF(cx - w * 0.5f, rect.top, cx + w * 0.5f, rect.top + h);
+        } else {
+            rect = D2D1::RectF(cx - w * 0.5f, cy - h * 0.5f, cx + w * 0.5f, cy + h * 0.5f);
+        }
 
         float radius = settings.w11Style ? 8.0f * settings.sizeScale : (rect.bottom - rect.top) * 0.5f;
-        if (settings.notchStyle) {
+        if (useNotchShape) {
             radius = 16.0f * settings.sizeScale;
         } else if (!settings.w11Style) {
             radius = std::min(radius, 44.0f * settings.sizeScale);
@@ -13111,11 +13172,14 @@ class Renderer {
             }
             brush->SetOpacity(alpha);
 
-            const D2D1_RECT_F shadowRect = D2D1::RectF(
-                rect.left - grow, rect.top - grow * 0.55f + yOffset,
-                rect.right + grow, rect.bottom + grow + yOffset);
+            const bool useNotch = g_settings.notchStyle || (g_settings.companionEyes && !IsBottomPosition(g_settings.position));
+            const D2D1_RECT_F shadowRect = useNotch ?
+                D2D1::RectF(rect.left - grow * 0.5f, rect.top,
+                            rect.right + grow * 0.5f, rect.bottom + grow + yOffset) :
+                D2D1::RectF(rect.left - grow, rect.top - grow * 0.55f + yOffset,
+                            rect.right + grow, rect.bottom + grow + yOffset);
             FillIslandShape(shadowRect, radius + grow, g_settings.w11Style,
-                            g_settings.notchStyle, brush);
+                            useNotch, brush);
         }
         brush->SetOpacity(1.0f);
     }
@@ -13267,11 +13331,38 @@ class Renderer {
         ComPtr<ID2D1GeometrySink> sink;
         if (FAILED(geom->Open(&sink))) return nullptr;
 
+        // 6. Fluid Jelly Spring Simulation:
+        // As the island expands/contracts, flares stretch and oscillate gently
+        const float curW = rect.right - rect.left;
+        if (g_companionEyes.prevWidth > 0.0f) {
+            float dw = curW - g_companionEyes.prevWidth;
+            if (fabsf(dw) > 0.15f) {
+                g_companionEyes.jellyVelocity += dw * 0.12f;
+            }
+        }
+        g_companionEyes.prevWidth = curW;
+        g_companionEyes.jellyVelocity += -140.0f * g_companionEyes.jellyFlex - 16.0f * g_companionEyes.jellyVelocity;
+        g_companionEyes.jellyFlex += g_companionEyes.jellyVelocity * 0.012f;
+        g_companionEyes.jellyFlex = Clamp(g_companionEyes.jellyFlex, -3.5f, 5.0f);
+
         float r = std::min({radius, (rect.right - rect.left) * 0.5f, (rect.bottom - rect.top) * 0.5f});
         if (r < 0.0f) r = 0.0f;
+        float baseFlare = (14.0f * g_settings.sizeScale) + g_companionEyes.jellyFlex;
+        float rf = std::min(baseFlare, (rect.bottom - rect.top) * 0.38f);
+        if (rf < 0.0f) rf = 0.0f;
 
-        sink->BeginFigure(D2D1::Point2F(rect.left, rect.top), D2D1_FIGURE_BEGIN_FILLED);
-        sink->AddLine(D2D1::Point2F(rect.right, rect.top));
+        // Top edge with smooth inverse fillets (concave flares merging into screen bezel)
+        sink->BeginFigure(D2D1::Point2F(rect.left - rf, rect.top), D2D1_FIGURE_BEGIN_FILLED);
+        sink->AddLine(D2D1::Point2F(rect.right + rf, rect.top));
+        if (rf > 0.0f) {
+            sink->AddBezier(D2D1::BezierSegment(
+                D2D1::Point2F(rect.right + rf * 0.45f, rect.top),
+                D2D1::Point2F(rect.right, rect.top + rf * 0.55f),
+                D2D1::Point2F(rect.right, rect.top + rf)));
+        } else {
+            sink->AddLine(D2D1::Point2F(rect.right, rect.top));
+        }
+
         sink->AddLine(D2D1::Point2F(rect.right, rect.bottom - r));
         if (r > 0.0f) {
             sink->AddArc(D2D1::ArcSegment(
@@ -13286,6 +13377,17 @@ class Renderer {
         } else {
             sink->AddLine(D2D1::Point2F(rect.left, rect.bottom));
         }
+
+        if (rf > 0.0f) {
+            sink->AddLine(D2D1::Point2F(rect.left, rect.top + rf));
+            sink->AddBezier(D2D1::BezierSegment(
+                D2D1::Point2F(rect.left, rect.top + rf * 0.55f),
+                D2D1::Point2F(rect.left - rf * 0.45f, rect.top),
+                D2D1::Point2F(rect.left - rf, rect.top)));
+        } else {
+            sink->AddLine(D2D1::Point2F(rect.left, rect.top));
+        }
+
         sink->EndFigure(D2D1_FIGURE_END_CLOSED);
         sink->Close();
 
@@ -13326,10 +13428,11 @@ class Renderer {
     // instead of the flat single-fill look it had before. Deliberately absent:
     // any bright rim, hairline or sheen tracing the island's edge.
     void DrawPillSurface(D2D1_RECT_F rect, float radius, IslandKind kind, const Settings& settings) {
+        const bool useNotchShape = settings.notchStyle || (settings.companionEyes && !IsBottomPosition(settings.position));
         // The dark tint scrim exists to deepen an opaque background. With a real
         // backdrop enabled it would just mud up the blur, so it is skipped.
         if (tintBrush_ && settings.backdropMaterial == BackdropMaterial::None) {
-            FillIslandShape(rect, radius, settings.w11Style, settings.notchStyle, tintBrush_.Get());
+            FillIslandShape(rect, radius, settings.w11Style, useNotchShape, tintBrush_.Get());
         }
 
         // Blur / acrylic and tint come from the DWM window below (see DwmBackdrop);
@@ -13345,7 +13448,7 @@ class Renderer {
             bg.a = std::min(bg.a, settings.backdropFillAlpha);
         }
         if (ID2D1SolidColorBrush* fillBrush = AcquireBrush(bg)) {
-            FillIslandShape(rect, radius, settings.w11Style, settings.notchStyle, fillBrush);
+            FillIslandShape(rect, radius, settings.w11Style, useNotchShape, fillBrush);
         }
 
         if (settings.materialDepth) {
@@ -13359,7 +13462,18 @@ class Renderer {
             FillAccentBloom(rect, radius, bloom * settings.accentBloom);
         }
 
-        if (settings.contourBorderMode != ContourBorderMode::Borderless && settings.contourBorderEnabled) {
+        // 7. Ambient Breathing Glow:
+        // Gentle rhythmic aura pulsating along the contour in idle/companion mode
+        if (settings.companionEyes && useNotchShape) {
+            double now = NowSeconds();
+            const float breath = 0.5f + 0.5f * sinf(static_cast<float>(now * 1.8)); // 3.5s smooth breathing cycle
+            const float glowAlpha = (0.04f + 0.07f * breath) * settingsOpacity_;
+            if (ID2D1SolidColorBrush* breathBrush = AcquireBrush(D2D1::ColorF(0.0f, 0.72f, 1.0f, glowAlpha))) {
+                DrawIslandShape(rect, radius, false, true, breathBrush, 1.8f * settings.sizeScale);
+            }
+        }
+
+        if (!settings.companionEyes && settings.contourBorderMode != ContourBorderMode::Borderless && settings.contourBorderEnabled) {
             D2D1_COLOR_F borderColor = settings.contourBorderColor;
             float strokeWidth = settings.w11Style ? 1.0f : 0.8f;
 
@@ -15399,6 +15513,392 @@ class Renderer {
         mutedBrush_->SetOpacity(0.75f);
     }
 
+    void DrawCompanionEyes(D2D1_RECT_F rect, const Settings& settings, const SharedState& state,
+                           double now, bool hover, float eyeScaleMult = 1.0f) {
+        const float cx = (rect.left + rect.right) * 0.5f;
+        const float cy = (rect.top + rect.bottom) * 0.5f;
+        const float scale = settings.sizeScale * eyeScaleMult;
+
+        // 1. Mouse Tracking & Global Dizzy Motion Detection:
+        POINT mousePt = {};
+        GetCursorPos(&mousePt);
+        float screenIslandX = static_cast<float>(lastOrigin_.x) + cx;
+        float screenIslandY = static_cast<float>(lastOrigin_.y) + cy;
+        float dx = static_cast<float>(mousePt.x) - screenIslandX;
+        float dy = static_cast<float>(mousePt.y) - screenIslandY;
+
+        float mouseDeltaX = static_cast<float>(mousePt.x - g_companionEyes.prevMousePt.x);
+        float mouseDeltaY = static_cast<float>(mousePt.y - g_companionEyes.prevMousePt.y);
+        double mouseDt = (g_companionEyes.lastMouseCheck > 0.0) ? (now - g_companionEyes.lastMouseCheck) : 0.016;
+        g_companionEyes.lastMouseCheck = now;
+        g_companionEyes.prevMousePt = mousePt;
+
+        // Dizzy Shake Detection:
+        // Must detect rapid zigzag reversals (wiggle / shake).
+        // Moving mouse across the screen (even very fast) has NO reversal and will NEVER trigger dizzy!
+        if (mouseDt > 0.001 && mouseDt < 0.1) {
+            float curSpeed = sqrtf(mouseDeltaX * mouseDeltaX + mouseDeltaY * mouseDeltaY) / static_cast<float>(mouseDt);
+            if (curSpeed > 1800.0f) {
+                bool reversedX = (mouseDeltaX > 32.0f && g_companionEyes.lastMouseDx < -32.0f) ||
+                                 (mouseDeltaX < -32.0f && g_companionEyes.lastMouseDx > 32.0f);
+                bool reversedY = (mouseDeltaY > 32.0f && g_companionEyes.lastMouseDy < -32.0f) ||
+                                 (mouseDeltaY < -32.0f && g_companionEyes.lastMouseDy > 32.0f);
+                if (reversedX || reversedY) {
+                    g_companionEyes.shakeAccum += 1.0f;
+                    g_companionEyes.lastShakeDirChange = now;
+                }
+                g_companionEyes.lastMouseDx = mouseDeltaX;
+                g_companionEyes.lastMouseDy = mouseDeltaY;
+            }
+            if (now - g_companionEyes.lastShakeDirChange > 0.4) {
+                g_companionEyes.shakeAccum *= 0.70f;
+            }
+            if (g_companionEyes.shakeAccum >= 5.0f) {
+                g_companionEyes.dizzyEndTime = now + 2.0; // dizzy for 2 seconds
+                g_companionEyes.shakeAccum = 0.0f;
+            }
+        }
+
+        const bool isDizzy = (now < g_companionEyes.dizzyEndTime);
+        const bool isPlayingMusic = (state.media.available && state.media.playing);
+
+        // System Idle Check (Mouse + Keyboard):
+        LASTINPUTINFO lii = { sizeof(LASTINPUTINFO) };
+        DWORD idleMs = 0;
+        if (GetLastInputInfo(&lii)) {
+            idleMs = GetTickCount() - lii.dwTime;
+        }
+
+        // 2. Deep Sleep with Drool after 10s idle (STRICTLY DISABLED when music is playing!):
+        if (idleMs >= 10000 && !isPlayingMusic) {
+            if (!g_companionEyes.isDeepSleeping) {
+                g_companionEyes.isDeepSleeping = true;
+                g_companionEyes.sleepStartTime = now;
+            }
+        } else if (g_companionEyes.isDeepSleeping) {
+            // Awakened by input or music playback!
+            g_companionEyes.isDeepSleeping = false;
+            if (!isPlayingMusic) {
+                // If awakened by mouse/keyboard input: Shock -> Angry sequence
+                g_companionEyes.startledEndTime = now + 0.6; // 0.6s panic shock
+                g_companionEyes.angryEndTime = now + 0.6 + 2.5; // 2.5s angry eyebrows & glare
+                TriggerNudge();
+            }
+        }
+
+        const bool isDeepSleeping = g_companionEyes.isDeepSleeping && !isPlayingMusic;
+        const bool isStartled = (now < g_companionEyes.startledEndTime) && !isPlayingMusic;
+        const bool isAngry = (!isStartled && now < g_companionEyes.angryEndTime) && !isPlayingMusic;
+
+        // 3. Typing Peek check:
+        bool isTyping = false;
+        if (idleMs < 650 && fabsf(mouseDeltaX) < 2.0f && fabsf(mouseDeltaY) < 2.0f && !hover && !isDeepSleeping && !isStartled && !isAngry) {
+            g_companionEyes.lastTypingTime = now;
+        }
+        isTyping = (now - g_companionEyes.lastTypingTime < 0.95);
+
+        // 4. Sleepy Mode check (late night >= 23:00 / < 06:00, or battery <= 20%):
+        SYSTEMTIME st = {};
+        GetLocalTime(&st);
+        const bool isNight = (st.wHour >= 23 || st.wHour < 6);
+        const bool isLowBattery = (!state.battery.charging && state.battery.percent > 0 && state.battery.percent <= 20);
+        const bool isSleepy = !isPlayingMusic && !isDeepSleeping && (isNight || isLowBattery) && !hover && !isTyping && !isDizzy && !isStartled && !isAngry && (fabsf(dx) > 160.0f * scale || dy > 120.0f * scale);
+
+        // Wake surprise transition
+        if (g_companionEyes.wasSleepy && (hover || fabsf(dx) < 70.0f * scale)) {
+            g_companionEyes.wakeSurpriseStartTime = now;
+            g_companionEyes.wasSleepy = false;
+        }
+        if (isSleepy) {
+            g_companionEyes.wasSleepy = true;
+        }
+
+        const bool isSurprised = (now - g_companionEyes.wakeSurpriseStartTime < 0.65);
+
+        // 5. Happy Charging trigger:
+        if (state.battery.charging && !g_companionEyes.prevCharging) {
+            g_companionEyes.happyChargingEndTime = now + 2.2;
+        }
+        g_companionEyes.prevCharging = state.battery.charging;
+        const bool isHappyCharging = (now < g_companionEyes.happyChargingEndTime) && !isDeepSleeping;
+
+        // Calculate Look Target
+        float targetLookX = Clamp(dx / 320.0f, -1.0f, 1.0f);
+        float targetLookY = Clamp(dy / 220.0f, -1.0f, 1.0f);
+
+        if (isTyping) {
+            targetLookY = 0.88f; // Gaze down towards keyboard
+            targetLookX *= 0.35f;
+        } else if (isAngry) {
+            targetLookX = Clamp(dx / 180.0f, -1.0f, 1.0f); // Glare intensely at cursor
+            targetLookY = Clamp(dy / 140.0f, -1.0f, 1.0f);
+        }
+
+        // Frame-rate independent exponential smoothing for buttery-smooth tracking at 60Hz - 360Hz+:
+        float dt = static_cast<float>(mouseDt);
+        if (dt < 0.0005f || dt > 0.1f) dt = 0.016f;
+        const float smoothFactor = 1.0f - expf(-18.0f * dt);
+
+        g_companionEyes.lookX += (targetLookX - g_companionEyes.lookX) * smoothFactor;
+        g_companionEyes.lookY += (targetLookY - g_companionEyes.lookY) * smoothFactor;
+
+        const float maxOffsetX = 5.0f * scale;
+        const float maxOffsetY = 3.5f * scale;
+        float pupilX = g_companionEyes.lookX * maxOffsetX;
+        float pupilY = g_companionEyes.lookY * maxOffsetY;
+
+        // Dizzy Roll pupil swirl:
+        if (isDizzy && !isDeepSleeping && !isStartled && !isAngry) {
+            const float dizzyRemain = static_cast<float>(g_companionEyes.dizzyEndTime - now) / 2.5f;
+            const float dizzyAngle = static_cast<float>(now * 15.0);
+            pupilX = cosf(dizzyAngle) * maxOffsetX * 0.95f * dizzyRemain;
+            pupilY = sinf(dizzyAngle) * maxOffsetY * 0.95f * dizzyRemain;
+        } else if (isStartled) {
+            pupilX += sinf(static_cast<float>(now * 52.0)) * 1.8f * scale;
+            pupilY += cosf(static_cast<float>(now * 47.0)) * 1.5f * scale;
+        }
+
+        // Natural Blinking:
+        if (g_companionEyes.nextBlinkTime <= 0.0) {
+            g_companionEyes.nextBlinkTime = now + 3.0;
+        }
+        if (now >= g_companionEyes.nextBlinkTime) {
+            g_companionEyes.blinkStartTime = now;
+            g_companionEyes.nextBlinkTime = now + (isSleepy ? 2.0 : 3.2) + static_cast<double>(rand() % 220) / 100.0;
+        }
+
+        float blinkRatio = 1.0f;
+        const double blinkElapsed = now - g_companionEyes.blinkStartTime;
+        const double blinkDuration = isSleepy ? 0.40 : 0.18;
+        if (blinkElapsed >= 0.0 && blinkElapsed < blinkDuration && !isDeepSleeping) {
+            const float t = static_cast<float>(blinkElapsed / blinkDuration);
+            blinkRatio = 0.5f + 0.5f * cosf(t * 6.2831853f); // 1 -> 0 -> 1
+        }
+
+        // Hover Interaction:
+        const float targetHoverHappy = hover ? 1.0f : 0.0f;
+        g_companionEyes.hoverHappy += (targetHoverHappy - g_companionEyes.hoverHappy) * 0.15f;
+
+        // Music beat bounce & head-bobbing:
+        float leftBobY = 0.0f;
+        float rightBobY = 0.0f;
+        if (state.media.available && state.media.playing && !isDeepSleeping) {
+            const float groovePhase = static_cast<float>(now * 6.2831853 * 1.85); // rhythmic beat ~110 bpm
+            leftBobY = sinf(groovePhase) * 2.0f * scale;
+            rightBobY = sinf(groovePhase + 0.35f) * 2.0f * scale; // alternating sway
+        }
+
+        // Deep sleep snoring breathing cycle:
+        float snorePhase = 0.0f;
+        if (isDeepSleeping) {
+            snorePhase = sinf(static_cast<float>((now - g_companionEyes.sleepStartTime) * 2.2));
+            leftBobY = snorePhase * 1.2f * scale;
+            rightBobY = snorePhase * 1.2f * scale;
+        } else if (isSleepy) {
+            const float drowsyNod = sinf(static_cast<float>(now * 1.5)) * 1.4f * scale;
+            leftBobY += drowsyNod;
+            rightBobY += drowsyNod;
+        }
+
+        // Base Eye geometry:
+        float baseEyeW = 7.5f * scale;
+        float baseEyeH = 13.0f * scale;
+        const float eyeSpacing = 18.0f * scale;
+
+        if (isDeepSleeping) {
+            baseEyeH = 0.0f; // Peaceful sleeping closed eyelid
+        } else if (isStartled) {
+            baseEyeW *= 1.45f; // Shocked wide open
+            baseEyeH *= 1.45f;
+        } else if (isAngry) {
+            baseEyeH *= 0.65f; // Slanted, narrowed glare
+            baseEyeW *= 1.08f;
+        } else if (isSleepy) {
+            baseEyeH *= 0.36f; // Droopy half-closed eyelids
+            baseEyeW *= 1.05f;
+        } else if (isSurprised) {
+            const float surpT = static_cast<float>(now - g_companionEyes.wakeSurpriseStartTime) / 0.65f;
+            const float surpScale = 1.0f + 0.32f * sinf(surpT * 3.14159f);
+            baseEyeW *= surpScale;
+            baseEyeH *= surpScale;
+        } else {
+            baseEyeW *= (1.0f + 0.12f * g_companionEyes.hoverHappy);
+            baseEyeH *= (1.0f + 0.12f * g_companionEyes.hoverHappy);
+        }
+
+        if (isTyping) {
+            baseEyeH *= 0.90f;
+            baseEyeW *= 1.05f;
+        }
+
+        const bool forceHappyCrescent = isHappyCharging;
+
+        // Draw Left (0) and Right (1) eyes
+        for (int eye = 0; eye < 2; ++eye) {
+            const bool isLeft = (eye == 0);
+            const float eyeCenterX = cx + (isLeft ? -eyeSpacing : eyeSpacing) + (isDeepSleeping ? 0.0f : pupilX);
+            const float eyeCenterY = cy + (isDeepSleeping ? 0.0f : pupilY) + (isLeft ? leftBobY : rightBobY);
+
+            float currentH = baseEyeH * blinkRatio;
+
+            // Closed eye (Deep Sleep, Blink, or Happy Charging Crescent):
+            if (forceHappyCrescent || isDeepSleeping || currentH < 2.0f * scale) {
+                D2D1_COLOR_F arcCol = isHappyCharging ? D2D1::ColorF(0.2f, 1.0f, 0.7f, 0.98f) : D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.95f);
+                if (ID2D1SolidColorBrush* lineBrush = AcquireBrush(arcCol)) {
+                    const float halfW = (isDeepSleeping ? 8.2f : baseEyeW * 1.15f) * (isDeepSleeping ? scale : 1.0f);
+                    ComPtr<ID2D1PathGeometry> arcGeom;
+                    if (SUCCEEDED(d2dFactory_->CreatePathGeometry(&arcGeom))) {
+                        ComPtr<ID2D1GeometrySink> sink;
+                        if (SUCCEEDED(arcGeom->Open(&sink))) {
+                            sink->BeginFigure(D2D1::Point2F(eyeCenterX - halfW, eyeCenterY), D2D1_FIGURE_BEGIN_HOLLOW);
+                            if (isDeepSleeping) {
+                                // Sleeping arc curving gently down
+                                sink->AddBezier(D2D1::BezierSegment(
+                                    D2D1::Point2F(eyeCenterX - halfW * 0.5f, eyeCenterY + 2.5f * scale),
+                                    D2D1::Point2F(eyeCenterX + halfW * 0.5f, eyeCenterY + 2.5f * scale),
+                                    D2D1::Point2F(eyeCenterX + halfW, eyeCenterY)));
+                            } else {
+                                // Happy crescent curving up
+                                sink->AddBezier(D2D1::BezierSegment(
+                                    D2D1::Point2F(eyeCenterX - halfW * 0.5f, eyeCenterY - 2.8f * scale),
+                                    D2D1::Point2F(eyeCenterX + halfW * 0.5f, eyeCenterY - 2.8f * scale),
+                                    D2D1::Point2F(eyeCenterX + halfW, eyeCenterY)));
+                            }
+                            sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                            sink->Close();
+                            target_->DrawGeometry(arcGeom.Get(), lineBrush, (isDeepSleeping ? 2.2f : 2.5f) * scale);
+                        }
+                    }
+                }
+
+                // Animated Floating "Zzz" when in Deep Sleep (snoring dream effect):
+                if (isDeepSleeping && !isLeft) {
+                    EnsureRoundJoinStyle();
+                    const double sleepDuration = (now - g_companionEyes.sleepStartTime);
+
+                    for (int zIdx = 0; zIdx < 3; ++zIdx) {
+                        // Stagger the 3 Zs across time:
+                        const float cycleDuration = 2.4f;
+                        const float timeOffset = zIdx * 0.8f;
+                        const float progress = fmodf(static_cast<float>(sleepDuration + timeOffset), cycleDuration) / cycleDuration;
+
+                        // Float upwards and drift gently to the right in a soft wave
+                        const float driftX = (10.0f + 16.0f * progress + 3.0f * sinf(progress * 6.283f)) * scale;
+                        const float riseY = (2.0f + 20.0f * progress) * scale;
+                        const float zOriginX = eyeCenterX + driftX;
+                        const float zOriginY = eyeCenterY - riseY;
+
+                        // Size grows as it rises (small z near face -> bigger Z higher up)
+                        const float zW = (3.8f + 3.6f * progress) * scale;
+                        const float zH = (4.5f + 4.2f * progress) * scale;
+                        const float zStroke = (1.3f + 0.5f * progress) * scale;
+
+                        // Smooth alpha: quick fade in (first 20%), soft fade out (last 35%)
+                        float zAlpha = 1.0f;
+                        if (progress < 0.20f) {
+                            zAlpha = progress / 0.20f;
+                        } else if (progress > 0.65f) {
+                            zAlpha = (1.0f - progress) / 0.35f;
+                        }
+                        zAlpha = Clamp(zAlpha, 0.0f, 1.0f) * 0.90f * settingsOpacity_;
+
+                        if (zAlpha > 0.02f) {
+                            // Soft dreamy pastel cyan glow
+                            D2D1_COLOR_F zCol = D2D1::ColorF(0.40f, 0.82f, 1.0f, zAlpha);
+                            if (ID2D1SolidColorBrush* zBrush = AcquireBrush(zCol)) {
+                                ComPtr<ID2D1PathGeometry> zPath;
+                                if (SUCCEEDED(d2dFactory_->CreatePathGeometry(&zPath))) {
+                                    ComPtr<ID2D1GeometrySink> sink;
+                                    if (SUCCEEDED(zPath->Open(&sink))) {
+                                        sink->BeginFigure(D2D1::Point2F(zOriginX, zOriginY), D2D1_FIGURE_BEGIN_HOLLOW);
+                                        sink->AddLine(D2D1::Point2F(zOriginX + zW, zOriginY));
+                                        sink->AddLine(D2D1::Point2F(zOriginX, zOriginY + zH));
+                                        sink->AddLine(D2D1::Point2F(zOriginX + zW, zOriginY + zH));
+                                        sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                                        sink->Close();
+                                        target_->DrawGeometry(zPath.Get(), zBrush, zStroke, roundJoinStyle_.Get());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Open eye: Multi-layer luminous glowing oval
+
+                // Layer 3: Outer bloom
+                D2D1_COLOR_F bloom3Col;
+                if (isAngry) {
+                    bloom3Col = D2D1::ColorF(1.0f, 0.20f, 0.05f, 0.30f * settingsOpacity_);
+                } else if (isHappyCharging) {
+                    bloom3Col = D2D1::ColorF(0.0f, 1.0f, 0.65f, 0.22f * settingsOpacity_);
+                } else {
+                    bloom3Col = D2D1::ColorF(0.0f, 0.70f, 1.0f, 0.14f * settingsOpacity_);
+                }
+
+                if (ID2D1SolidColorBrush* halo3 = AcquireBrush(bloom3Col)) {
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW + 7.5f * scale, currentH + 7.5f * scale), halo3);
+                }
+
+                // Layer 2: Soft bloom
+                D2D1_COLOR_F bloom2Col = isAngry ? D2D1::ColorF(1.0f, 0.40f, 0.12f, 0.45f * settingsOpacity_)
+                                                 : D2D1::ColorF(0.85f, 0.95f, 1.0f, 0.35f * settingsOpacity_);
+                if (ID2D1SolidColorBrush* halo2 = AcquireBrush(bloom2Col)) {
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW + 3.8f * scale, currentH + 3.8f * scale), halo2);
+                }
+
+                // Layer 1: Bright aura
+                const float halo1Alpha = 0.65f * settingsOpacity_;
+                if (ID2D1SolidColorBrush* halo1 = AcquireBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, halo1Alpha))) {
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW + 1.6f * scale, currentH + 1.6f * scale), halo1);
+                }
+
+                // Core: Brilliant solid core
+                D2D1_COLOR_F coreCol = isAngry ? D2D1::ColorF(1.0f, 0.94f, 0.88f, 1.0f * settingsOpacity_)
+                                               : D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f * settingsOpacity_);
+                if (ID2D1SolidColorBrush* core = AcquireBrush(coreCol)) {
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW, currentH), core);
+                }
+
+                // Specular reflection highlight dot
+                if (currentH > 4.5f * scale) {
+                    if (ID2D1SolidColorBrush* spec = AcquireBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.90f * settingsOpacity_))) {
+                        target_->FillEllipse(D2D1::Ellipse(
+                            D2D1::Point2F(eyeCenterX - baseEyeW * 0.28f, eyeCenterY - currentH * 0.32f),
+                            2.0f * scale, 2.2f * scale), spec);
+                    }
+                }
+            }
+
+            // Compact, Sharp Angry Eyebrows (\ /) directly above each eye:
+            if (isAngry) {
+                D2D1_COLOR_F browCol = D2D1::ColorF(1.0f, 0.28f, 0.10f, 0.96f * settingsOpacity_);
+                if (ID2D1SolidColorBrush* browBrush = AcquireBrush(browCol)) {
+                    const float browStroke = 2.6f * scale;
+                    D2D1_POINT_2F pStart, pEnd;
+                    if (isLeft) {
+                        // Left brow slants down towards center \ (compact, exactly over eye)
+                        pStart = D2D1::Point2F(eyeCenterX - 9.0f * scale, eyeCenterY - currentH - 4.5f * scale);
+                        pEnd   = D2D1::Point2F(eyeCenterX + 7.5f * scale, eyeCenterY - currentH - 1.2f * scale);
+                    } else {
+                        // Right brow slants down towards center / (compact, exactly over eye)
+                        pStart = D2D1::Point2F(eyeCenterX - 7.5f * scale, eyeCenterY - currentH - 1.2f * scale);
+                        pEnd   = D2D1::Point2F(eyeCenterX + 9.0f * scale, eyeCenterY - currentH - 4.5f * scale);
+                    }
+
+                    target_->DrawLine(pStart, pEnd, browBrush, browStroke);
+                    // Rounded endcaps
+                    target_->FillEllipse(D2D1::Ellipse(pStart, browStroke * 0.5f, browStroke * 0.5f), browBrush);
+                    target_->FillEllipse(D2D1::Ellipse(pEnd, browStroke * 0.5f, browStroke * 0.5f), browBrush);
+                }
+            }
+        }
+    }
+
     void DrawIdleDashboard(const SharedState& state, D2D1_RECT_F rect, const Settings& settings,
                            double now) {
         if (settings.gameOverlay || g_gameOverlayPinned.load()) {
@@ -15417,13 +15917,18 @@ class Renderer {
 
         const float dashHeight = rect.bottom - rect.top;
         const float dashRadius = ContentIslandRadius(dashHeight);
-        ComPtr<ID2D1Geometry> dashMask = CreateIslandMaskGeometry(rect, dashRadius, g_settings.notchStyle);
+        const bool useNotchDash = g_settings.notchStyle || (g_settings.companionEyes && !IsBottomPosition(g_settings.position));
+        D2D1_RECT_F maskRect = rect;
+        if (g_companionEyes.isDeepSleeping) {
+            maskRect.bottom += 36.0f;
+        }
+        ComPtr<ID2D1Geometry> dashMask = CreateIslandMaskGeometry(maskRect, dashRadius, useNotchDash);
         ID2D1Layer* dashLayer = AcquireLayer();
         const bool haveDashMask = dashMask && dashLayer;
         if (haveDashMask) {
-            target_->PushLayer(D2D1::LayerParameters(rect, dashMask.Get(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE), dashLayer);
+            target_->PushLayer(D2D1::LayerParameters(maskRect, dashMask.Get(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE), dashLayer);
         } else {
-            target_->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            target_->PushAxisAlignedClip(maskRect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         }
 
         SYSTEMTIME local = {};
@@ -15465,12 +15970,15 @@ class Renderer {
 
         if (collapsedAlpha > 0.01f) {
             if (dashFadeLayer) {
-                target_->PushLayer(D2D1::LayerParameters(rect, nullptr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                target_->PushLayer(D2D1::LayerParameters(maskRect, nullptr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                                                           D2D1::IdentityMatrix(), collapsedAlpha, nullptr,
                                                           D2D1_LAYER_OPTIONS_NONE),
                                    dashFadeLayer);
             }
 
+            if (settings.companionEyes) {
+                DrawCompanionEyes(rect, settings, state, now, hover_);
+            } else {
             // Collapsed Mode (Apple Dynamic Island status bar).
             //
             // Slots are placed from the same measurements that sized the pill, so
@@ -15541,6 +16049,8 @@ class Renderer {
                                    wRect, textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
             }
             textBrush_->SetOpacity(1.0f);
+
+            } // end else companionEyes
 
             if (dashFadeLayer) {
                 target_->PopLayer();
@@ -15990,7 +16500,8 @@ class Renderer {
     // stadium corner arc grew with the size scale until it cut across the album
     // art's top-left corner (visible from roughly 2x upwards).
     float ContentIslandRadius(float contentHeight) const {
-        if (g_settings.notchStyle) {
+        const bool useNotch = g_settings.notchStyle || (g_settings.companionEyes && !IsBottomPosition(g_settings.position));
+        if (useNotch) {
             return 16.0f;
         }
         if (g_settings.w11Style) {
@@ -16036,7 +16547,8 @@ class Renderer {
         PublishContentGeometry(rect, sideLyricsExtra);
 
         const float radius = ContentIslandRadius(height);
-        ComPtr<ID2D1Geometry> mask = CreateIslandMaskGeometry(rect, radius, settings.notchStyle);
+        const bool useNotchMedia = settings.notchStyle || (settings.companionEyes && !IsBottomPosition(settings.position));
+        ComPtr<ID2D1Geometry> mask = CreateIslandMaskGeometry(rect, radius, useNotchMedia);
         ID2D1Layer* layer = AcquireLayer();
 
         float expandedAlpha = std::clamp((height - MediaLayout::kExpandedMinHeight) / 60.0f, 0.0f, 1.0f);
@@ -16182,7 +16694,7 @@ class Renderer {
                                                    rect.top + 20.0f + (artSize + waveH) * 0.5f);
 
                 const float textLeft = artRect.right + 18.0f;
-                const float textRight = waveRect.left - 16.0f;
+                const float textRight = settings.companionEyes ? (waveRect.left - 54.0f) : (waveRect.left - 16.0f);
 
                 // Title — bold, prominent.
                 D2D1_RECT_F titleRect = D2D1::RectF(textLeft, rect.top + 34.0f, textRight, rect.top + 54.0f);
@@ -16221,6 +16733,13 @@ class Renderer {
                         const float dotX = waveRect.left + i * (barWidth + gap) + barWidth * 0.5f;
                         target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, centerY), 1.2f, 1.2f), mutedBrush_.Get());
                     }
+                }
+
+                // Grooving Companion Eyes in expanded media view:
+                if (settings.companionEyes) {
+                    D2D1_RECT_F eyesExpandedRect = D2D1::RectF(waveRect.left - 48.0f, waveRect.top - 2.0f,
+                                                              waveRect.left - 8.0f, waveRect.bottom + 2.0f);
+                    DrawCompanionEyes(eyesExpandedRect, settings, state, now, hover_, 0.65f);
                 }
 
                 // Source line, under the artist (or under the album when there is one).
@@ -16429,8 +16948,17 @@ class Renderer {
                 shiftX = 22.0f;
             }
 
-            D2D1_RECT_F waveRect = D2D1::RectF(rect.right - 42.0f - shiftX, cy - 10.0f,
-                                               rect.right - 14.0f - shiftX, cy + 10.0f);
+            float eyesWidth = 0.0f;
+            D2D1_RECT_F eyesPillRect = {};
+            if (settings.companionEyes) {
+                eyesWidth = 32.0f;
+                eyesPillRect = D2D1::RectF(rect.right - 10.0f - eyesWidth - shiftX, cy - 14.0f,
+                                           rect.right - 10.0f - shiftX, cy + 14.0f);
+            }
+
+            const float waveOffsetRight = (eyesWidth > 0.0f) ? (10.0f + eyesWidth + 6.0f) : 14.0f;
+            D2D1_RECT_F waveRect = D2D1::RectF(rect.right - 28.0f - waveOffsetRight - shiftX, cy - 10.0f,
+                                               rect.right - waveOffsetRight - shiftX, cy + 10.0f);
             if (state.media.playing) {
                 DrawSpectrum(state, waveRect, settings, now);
             } else {
@@ -16443,6 +16971,11 @@ class Renderer {
                     const float dotX = waveRect.left + i * (barWidth + gap) + barWidth * 0.5f;
                     target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, cy), 1.2f, 1.2f), mutedBrush_.Get());
                 }
+            }
+
+            // Draw grooving Companion Eyes right beside the waveform/lyrics!
+            if (settings.companionEyes) {
+                DrawCompanionEyes(eyesPillRect, settings, state, now, hover_, 0.58f);
             }
 
             // Lyrics between the album art and the visualiser. Fades in as the
@@ -20698,8 +21231,9 @@ class Renderer {
         const float alpha = SmoothStep01((h - need * 0.55f) / (need * 0.45f));
         if (alpha <= 0.01f) return;  // island still too small; content fades in as it opens
 
+        const bool useNotchLookup = settings.notchStyle || (settings.companionEyes && !IsBottomPosition(settings.position));
         ComPtr<ID2D1Geometry> mask =
-            CreateIslandMaskGeometry(rect, ContentIslandRadius(h), settings.notchStyle);
+            CreateIslandMaskGeometry(rect, ContentIslandRadius(h), useNotchLookup);
         ID2D1Layer* layer = AcquireLayer();
         const bool masked = mask && layer;
         if (masked) {
@@ -20972,6 +21506,7 @@ class Renderer {
     double lyricsWaveformFadeTime_ = -1.0;
     double lyricsLastDrawn_ = -1.0;  // last frame the lyrics tab was painted
     float  hoverScale_ = 1.0f;       // pill scale set by Render(); gives the resting expanded size
+    bool   hover_ = false;
     float  islandSizeLastW_ = 0.0f;  // island resize tracking (see DrawMedia)
     float  islandSizeLastH_ = 0.0f;
     double islandSizeMovedAt_ = -1e9;
@@ -21167,6 +21702,9 @@ Activity ActivityForKind(IslandKind kind, const Settings& settings, const Shared
             if (settings.autoHideIdleSeconds == -1 && !state.system.micActive && !state.system.cameraActive) {
                 activity.width = 0.0f;
                 activity.height = 0.0f;
+            } else if (settings.companionEyes) {
+                activity.width = 185.0f;
+                activity.height = 42.0f;
             } else {
                 // Seed only. The real collapsed width is measured from the clock
                 // and weather strings by Renderer::MeasureIdleStrip and applied in
@@ -21266,6 +21804,9 @@ DWORD g_keyboardThreadId = 0;
 // thread, after checking the setting. Nothing is lost by only posting.
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
+        if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+            g_companionEyes.lastTypingTime = NowSeconds();
+        }
         if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
             auto* kbd = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
             if (kbd->vkCode == VK_CAPITAL || kbd->vkCode == VK_NUMLOCK) {
@@ -21286,7 +21827,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 // hook exists solely to notice Caps Lock and Num Lock for the indicator pill;
 // with that module off it was still running for nothing.
 static bool CapsLockHookWanted() {
-    return g_settings.capsLock;
+    return g_settings.capsLock || g_settings.companionEyes;
 }
 
 // Wakes the keyboard thread so it re-evaluates whether the hook is needed.
@@ -23284,6 +23825,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 }
 
 DWORD WINAPI RenderThreadProc(void*) {
+    Wh_Log(L"RenderThreadProc ENTERED!");
     HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
     WNDCLASSEXW wc = {};
@@ -23299,8 +23841,10 @@ DWORD WINAPI RenderThreadProc(void*) {
         kWindowClass, L"Dynamic Island for Windows", WS_POPUP, 0, 0, 520, 140,
         nullptr, nullptr, wc.hInstance, nullptr);
 
+    Wh_Log(L"CreateWindowEx called, hwnd=%p, lastError=%lu", hwnd, GetLastError());
     if (!hwnd) {
-        Wh_Log(L"Failed to create Dynamic Island overlay window.");
+        DWORD err = GetLastError();
+        Wh_Log(L"Failed to create Dynamic Island overlay window. Error: %lu", err);
         if (SUCCEEDED(hrCo)) {
             CoUninitialize();
         }
@@ -23343,6 +23887,7 @@ DWORD WINAPI RenderThreadProc(void*) {
 
     Renderer renderer;
     if (!renderer.Initialize(hwnd)) {
+        Wh_Log(L"renderer.Initialize failed!");
         DestroyWindow(hwnd);
         g_hwnd = nullptr;
         if (SUCCEEDED(hrCo)) {
@@ -23350,6 +23895,7 @@ DWORD WINAPI RenderThreadProc(void*) {
         }
         return 0;
     }
+    Wh_Log(L"Renderer initialized successfully! Entering main render loop...");
 
     // Restore the File Tray from disk. Done here because the shell icons need the
     // COM apartment this thread already initialised.
@@ -23855,11 +24401,14 @@ DWORD WINAPI RenderThreadProc(void*) {
                 const float clockSection = g_settings.mediaPillClock
                     ? renderer.MeasureMediaPill(snapshot, g_settings).sectionWidth
                     : 0.0f;
+                const float eyeBonus = g_settings.companionEyes ? 38.0f : 0.0f;
                 if (CollapsedLyricsActive(snapshot, g_settings)) {
                     // Collapsed but carrying lyrics: wider pill, same height.
-                    primary.width = (kCollapsedLyricsWidth + clockSection) * g_settings.sizeScale;
+                    primary.width = (kCollapsedLyricsWidth + clockSection + eyeBonus) * g_settings.sizeScale;
                 } else if (g_settings.mediaPillClock) {
-                    primary.width = (MediaPillLayout::kBaseWidth + clockSection) * g_settings.sizeScale;
+                    primary.width = (MediaPillLayout::kBaseWidth + clockSection + eyeBonus) * g_settings.sizeScale;
+                } else if (g_settings.companionEyes) {
+                    primary.width = (MediaPillLayout::kBaseWidth + eyeBonus) * g_settings.sizeScale;
                 }
             }
         }
@@ -24109,7 +24658,8 @@ DWORD WINAPI RenderThreadProc(void*) {
             mediaAnimating || isTransientPill(primary.kind) ||
             (secondary && isTransientPill(secondary->kind)) ||
             (countdownBarsOn && (hasCountdownBar(primary.kind) ||
-                                 (secondary && hasCountdownBar(secondary->kind))));
+                                 (secondary && hasCountdownBar(secondary->kind)))) ||
+            (g_settings.companionEyes && !isHidden);
         if (continuousAnimation) {
             needsRender = true;
         }
@@ -24305,26 +24855,11 @@ DWORD WINAPI RenderThreadProc(void*) {
             std::fabs(volumeBarSpring.velocity) > 0.5f ||
             g_tabAnimating.load(std::memory_order_relaxed);
 
-        if (continuousAnimation && !springsAnimating) {
-            constexpr double kContinuousFrameMs = 1000.0 / 60.0;
-            targetFrameMs = std::max(targetFrameMs, kContinuousFrameMs);
-        }
+        // High refresh rate (60Hz to 360Hz/500Hz):
+        // Allow continuous animation (companion eyes gaze tracking, music head-bobbing, floating Zzz)
+        // to render at the native high refresh rate without throttling down to 60 FPS!
 
         // Keyed to actual animation, not to repainting.
-        //
-        // A single repaint does not need 1ms pacing -- it needs one frame, which the
-        // pacer delivers fine at the default resolution. Only things that draw a
-        // *sequence* of frames care: continuous content and spring motion.
-        //
-        // Keying it to needsRender was wrong twice over. Per frame it thrashed,
-        // because needsRender alternates when 60Hz content runs under a higher
-        // Target FPS. And with the hold added, any one-off repaint still took the
-        // resolution for the full hold -- including the metric tick, which fired
-        // every second, so a plain idle island requested and released it once a
-        // second and held it roughly half the time with nothing moving at all.
-        //
-        // continuousAnimation and springsAnimating are exactly the two cases that
-        // want precise frame spacing, so they drive it directly.
         if (continuousAnimation || springsAnimating) {
             lastAnimatingAt = now;
         }
@@ -24335,10 +24870,9 @@ DWORD WINAPI RenderThreadProc(void*) {
             // frame rate. A settled strip only needs to notice the cursor, so ~20Hz.
             WaitForSingleObject(g_stopEvent, (stripActive && !springsAnimating) ? 50 : 16);
             nextFrameTarget = std::chrono::steady_clock::now();
-        } else if (springsAnimating && g_settings.targetFps <= 0 && SUCCEEDED(DwmFlush())) {
-            // Auto FPS while the island is resizing: block until DWM's next
-            // composition so every frame lands exactly on a vsync. A timer drifts
-            // against the display's refresh and produces judder even at high fps.
+        } else if ((springsAnimating || continuousAnimation) && g_settings.targetFps <= 0 && SUCCEEDED(DwmFlush())) {
+            // Auto FPS while animating: block on DWM's composition vsync for ultra-smooth
+            // native refresh rate (up to 300Hz/360Hz+) with perfect frame pacing and zero judder.
             nextFrameTarget = std::chrono::steady_clock::now();
         } else {
             // When animating, achieve ultra-smooth target refresh rate (e.g. 144Hz, 240Hz, 360Hz+).
@@ -24348,13 +24882,12 @@ DWORD WINAPI RenderThreadProc(void*) {
             auto nowTime = std::chrono::steady_clock::now();
             if (nowTime < nextFrameTarget) {
                 double remainingMs = std::chrono::duration<double, std::milli>(nextFrameTarget - nowTime).count();
-                if (remainingMs >= 1.5) {
+                if (remainingMs >= 2.0) {
                     // Sleep for the bulk of the remaining time using OS event wait (zero CPU usage)
-                    WaitForSingleObject(g_stopEvent, static_cast<DWORD>(remainingMs - 0.5));
+                    WaitForSingleObject(g_stopEvent, static_cast<DWORD>(remainingMs - 1.0));
                 }
-                // Spinning only pays off for fast spring motion on high refresh rates.
-                // For 60Hz content a frame landing under 1ms late is invisible, so sleep only.
-                if (springsAnimating && targetFrameMs < 10.0) {
+                // Spinning only pays off for fast motion on high refresh rates.
+                if ((springsAnimating || continuousAnimation) && targetFrameMs < 10.0) {
                     while (std::chrono::steady_clock::now() < nextFrameTarget &&
                            WaitForSingleObject(g_stopEvent, 0) == WAIT_TIMEOUT) {
                         std::this_thread::yield();
@@ -24491,6 +25024,14 @@ void WhTool_ModUninit() {
     StopThreads();
     Wh_Log(L"Dynamic Island for Windows unloaded.");
 }
+
+void WhTool_WaitForRenderThread() {
+    if (g_renderThread) {
+        WaitForSingleObject(g_renderThread, INFINITE);
+    }
+}
+
+#ifndef STANDALONE_BUILD
 
 //////////////////////////////////////////////////////////////////////////////////
 // Windhawk tool mod implementation for mods which don't need to inject to other
@@ -24670,3 +25211,4 @@ void Wh_ModUninit() {
     WhTool_ModUninit();
     ExitProcess(0);
 }
+#endif // !STANDALONE_BUILD
