@@ -514,7 +514,7 @@ We love community contributions! To ensure high-quality updates, please follow t
   - QuickLookup: false
     $name: Quick Lookup (hotkey)
     $description: "Press the Quick Lookup hotkey (Shortcuts tab) to open a search box on the island. Type a word or short phrase and press Enter, or pick your clipboard text or a recent lookup. Nothing is sent anywhere until you submit a search; searches go to en.wiktionary.org and en.wikipedia.org (and api.dictionaryapi.dev as a backup dictionary). Recent lookups are kept in memory only and cleared when the mod restarts."
-  - FileTrayModule: false
+  - FileTrayModule: true
     $name: File Tray (drag & drop shelf)
     $description: Adds a File Tray card to the scroll loop. Drag files onto the island to park them there, then click to open one, or use the right-click menu to clear the shelf. Files are only referenced, never copied or moved.
   - FileTrayMaxItems: 10
@@ -680,6 +680,7 @@ constexpr UINT WM_APP_MOUSE_WAKE = WM_APP + 0x446;
 // thread, so hotkey and backdrop changes are posted across and applied there.
 constexpr UINT WM_APP_APPLY_HOTKEY = WM_APP + 0x447;
 constexpr UINT WM_APP_APPLY_BACKDROP = WM_APP + 0x448;
+constexpr UINT WM_APP_OPEN_CLIPBOARD_HISTORY = WM_APP + 0x449;
 constexpr int ID_HIDE_SHOW_HOTKEY = 1;
 constexpr int ID_LOOKUP_HOTKEY = 2;
 constexpr float kRenderPadX = 28.0f;
@@ -1301,7 +1302,7 @@ struct Settings {
     std::wstring language = L"auto";
 
     // ── File tray (#33) ──────────────────────────────────────────────────────
-    bool fileTrayModule = false;
+    bool fileTrayModule = true;
     int fileTrayMaxItems = 10;
     bool fileTrayPersist = true;   // Modules.FileTrayPersist
     bool fileTrayPager = true;     // Modules.FileTrayNavigation: show the < 1/4 > pager
@@ -1639,6 +1640,16 @@ struct LookupUiState {
 };
 LookupUiState g_lookupUi;
 
+struct ClipboardHistoryItem {
+    std::wstring text;       // short display text
+    std::wstring fullText;   // complete full text for pasting
+    bool isImage = false;
+    PixelsRef imagePreview;  // image thumbnail pixels
+    std::wstring appName;    // source app name
+    PixelsRef appIcon;       // source app icon
+    double copiedAt = 0.0;
+};
+
 struct SharedState {
     MediaSnapshot media;
     std::vector<MediaSourceInfo> mediaSources;  // stable dock order
@@ -1663,6 +1674,7 @@ struct SharedState {
     std::array<float, kSpectrumBands> bands{};  // smoothed 0..1 magnitude per band (low -> high)
     bool muted = false;
     std::vector<FileTrayItem> fileTrayItems;
+    std::vector<ClipboardHistoryItem> clipboardHistory;
 };
 
 struct SpringValue {
@@ -1770,6 +1782,13 @@ std::atomic<bool> g_fileTrayPagerOn{true};      // Modules.FileTrayNavigation: p
 std::atomic<bool> g_fileTrayWheelOn{false};     // Modules.FileTrayNavigation: wheel scroll + scrollbar
 std::atomic<bool> g_trayDragOver{false};      // a file drag from outside is hovering the island
 std::atomic<bool> g_trayInternalDrag{false};  // a drag that started from the tray itself is running
+std::atomic<bool> g_trayAutoPinned{false};    // auto-pinned when files are dropped, cleared when emptied!
+std::atomic<double> g_ctrlCDownTime{0.0};     // timestamp when Ctrl+C was pressed down
+std::atomic<bool> g_ctrlCHistoryTriggered{false}; // whether long-press Ctrl+C already fired
+HWND g_prevClipboardWindow = nullptr;         // active window prior to opening clipboard history
+std::atomic<int> g_clipboardScroll{0};        // scroll offset in clipboard history
+std::atomic<int> g_hoveredClipboardRow{-1};   // row index hovered in clipboard history
+std::atomic<int> g_hoveredClipboardAction{-1};// -2 = clear bin, >=0 = row click
 std::atomic<int> g_tabEdgeBump{0};            // +1 / -1: wheel or swipe pushed past the last / first tab
 std::atomic<double> g_tabLastPaintAt{0.0};    // last time the tab view painted a moving frame
 std::atomic<bool> g_tabAnimating{false};      // a tab transition is in motion (render loop paces frames for it)
@@ -1971,6 +1990,7 @@ int ActiveTabCount(const Settings& settings) {
     if (settings.weather) ++count;
     if (settings.hardwareMonitorModule) ++count;
     if (settings.fileTrayModule) ++count;
+    if (settings.clipboard) ++count;
     if (settings.lyrics && g_lyricsTabAvailable.load(std::memory_order_relaxed)) ++count;
     return count;
 }
@@ -2007,6 +2027,14 @@ int FileTrayTabIndex(const Settings& settings) {
     }
     return 2 + (settings.weather ? 1 : 0) + (settings.hardwareMonitorModule ? 1 : 0) +
            MediaTabIndex(settings);
+}
+
+int ClipboardHistoryTabIndex(const Settings& settings) {
+    if (!settings.clipboard) {
+        return -1;
+    }
+    return 2 + (settings.weather ? 1 : 0) + (settings.hardwareMonitorModule ? 1 : 0) +
+           (settings.fileTrayModule ? 1 : 0) + MediaTabIndex(settings);
 }
 
 // Moves the dashboard one tab (+1 = next, -1 = previous). Clamped at both ends:
@@ -3188,7 +3216,7 @@ void LoadSettings() {
     }
 
     // ── File tray (#33) ──────────────────────────────────────────────────────
-    next.fileTrayModule = Wh_GetIntSetting(L"Modules.FileTrayModule") != 0;
+    next.fileTrayModule = true; // Built-in default feature as requested by user
     next.fileTrayMaxItems = ClampInt(Wh_GetIntSetting(L"Modules.FileTrayMaxItems"), 1, 25);
     next.fileTrayPersist = Wh_GetIntSetting(L"Modules.FileTrayPersist") != 0;
     {
@@ -9663,8 +9691,9 @@ void CaptureClipboard(HWND hwnd) {
         }
     }
 
-    std::wstring text = ReadClipboardText(hwnd);
-    if (!text.empty()) {
+    std::wstring rawFullText = ReadClipboardText(hwnd);
+    if (!rawFullText.empty()) {
+        std::wstring text = rawFullText;
         constexpr size_t maxChars = 96;
         std::replace(text.begin(), text.end(), L'\r', L' ');
         std::replace(text.begin(), text.end(), L'\n', L' ');
@@ -9686,9 +9715,38 @@ void CaptureClipboard(HWND hwnd) {
     }
 
     if (clip.active) {
+        ClipboardHistoryItem histItem;
+        histItem.copiedAt = NowSeconds();
+        histItem.appName = clip.appName;
+        histItem.appIcon = clip.appIcon;
+        if (clip.image) {
+            histItem.isImage = true;
+            histItem.imagePreview = clip.imagePreview;
+            histItem.text = Loc(L"Image copied");
+        } else {
+            histItem.isImage = false;
+            histItem.text = clip.text;
+            histItem.fullText = rawFullText;
+        }
+
         {
             std::lock_guard lock(g_stateMutex);
-            g_state.clipboard = std::move(clip);
+            g_state.clipboard = clip;
+
+            // Deduplicate if top item is identical
+            bool isDup = false;
+            if (!g_state.clipboardHistory.empty()) {
+                const auto& top = g_state.clipboardHistory.front();
+                if (!histItem.isImage && !top.isImage && top.fullText == histItem.fullText) {
+                    isDup = true;
+                }
+            }
+            if (!isDup) {
+                g_state.clipboardHistory.insert(g_state.clipboardHistory.begin(), std::move(histItem));
+                if (g_state.clipboardHistory.size() > 15) {
+                    g_state.clipboardHistory.resize(15);
+                }
+            }
         }
     }
 }
@@ -12114,6 +12172,7 @@ class Renderer {
         pillCount_ = 0;  // DrawPill records each pill it draws for the backdrop windows
 
         target_->BeginDraw();
+        target_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         target_->SetTransform(D2D1::Matrix3x2F::Translation(-static_cast<float>(dirty.left),
                                                             -static_cast<float>(dirty.top)));
         // Clear() honours the active clip, so this only wipes the dirty region.
@@ -12541,13 +12600,13 @@ class Renderer {
                      DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
                      DWRITE_FONT_STRETCH_NORMAL, 13.0f * ts, idleTextFormat_);
         createFormat(mainFamily, defaultDisplay,
-                     DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL,
-                     DWRITE_FONT_STRETCH_NORMAL, 63.0f * ts, calDayLargeFormat_);
+                     DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+                     DWRITE_FONT_STRETCH_NORMAL, 50.0f * ts, calDayLargeFormat_);
         createFormat(mainFamily, defaultDisplay,
-                     DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL,
+                     DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
                      DWRITE_FONT_STRETCH_NORMAL, 14.4f * ts, calGridFormat_);
         createFormat(mainFamily, defaultDisplay,
-                     DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL,
+                     DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
                      DWRITE_FONT_STRETCH_NORMAL, 56.0f * ts, timeDashboardFormat_);
         createFormat(mainFamily, defaultDisplay,
                      DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
@@ -13618,7 +13677,7 @@ class Renderer {
             smallTextFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             target_->DrawTextW(yearStr, static_cast<UINT32>(wcslen(yearStr)), smallTextFormat_.Get(),
                                D2D1::RectF(hero.left, hero.top + 21.0f * scale,
-                                           hero.right, hero.top + 36.0f * scale),
+                                           hero.right, hero.top + 34.0f * scale),
                                mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
             smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             smallTextFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
@@ -13629,9 +13688,9 @@ class Renderer {
         textBrush_->SetOpacity(0.97f);
         target_->DrawTextW(dayStr, static_cast<UINT32>(wcslen(dayStr)),
                            calDayLargeFormat_ ? calDayLargeFormat_.Get() : hugeTextFormat_.Get(),
-                           D2D1::RectF(hero.left, hero.top + 34.0f * scale,
+                           D2D1::RectF(hero.left, hero.top + 36.0f * scale,
                                        hero.right, hero.bottom - 26.0f * scale),
-                           textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+                           textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         mutedBrush_->SetOpacity(0.70f);
         if (boldTextFormat_) {
@@ -14774,6 +14833,135 @@ class Renderer {
 
         textBrush_->SetOpacity(0.96f);
         mutedBrush_->SetOpacity(0.75f);
+    }
+
+    void DrawPixels(const BitmapPixels& pixels, D2D1_RECT_F rect, float opacity = 1.0f) {
+        if (pixels.bgra.empty() || pixels.width == 0 || pixels.height == 0) return;
+        D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+        ComPtr<ID2D1Bitmap> bmp;
+        if (SUCCEEDED(target_->CreateBitmap(D2D1::SizeU(pixels.width, pixels.height),
+                                            pixels.bgra.data(), pixels.width * 4,
+                                            &props, &bmp)) && bmp) {
+            target_->DrawBitmap(bmp.Get(), rect, opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        }
+    }
+
+    void DrawClipboardHistoryDashboard(const SharedState& state, D2D1_RECT_F rect,
+                                       const Settings& settings, float scale) {
+        const float padX = FileTrayLayout::kPadX * scale;
+
+        // Header: title on the left, count + clear button on the right.
+        const D2D1_RECT_F headerRect = D2D1::RectF(rect.left + padX, rect.top + 18.0f * scale,
+                                                   rect.right - padX, rect.top + 38.0f * scale);
+        textBrush_->SetOpacity(0.96f);
+        if (boldTextFormat_) {
+            boldTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            const wchar_t* title = Loc(L"Clipboard History");
+            target_->DrawTextW(title, static_cast<UINT32>(wcslen(title)), boldTextFormat_.Get(),
+                               headerRect, textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+            boldTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+
+        const size_t total = state.clipboardHistory.size();
+        const float clearSize = FileTrayLayout::kClearBtnSize * scale;
+        const float clearTop = rect.top + FileTrayLayout::kClearBtnTop * scale;
+        const D2D1_RECT_F clearBox = D2D1::RectF(rect.right - padX - clearSize, clearTop,
+                                                 rect.right - padX, clearTop + clearSize);
+
+        if (total > 0 && smallTextFormat_) {
+            wchar_t countBuf[48] = {};
+            swprintf_s(countBuf, L"%zu %s", total, Loc(total == 1 ? L"item" : L"items"));
+            const D2D1_RECT_F countRect = D2D1::RectF(headerRect.left, headerRect.top,
+                                                      clearBox.left - 8.0f * scale, headerRect.bottom);
+            smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+            mutedBrush_->SetOpacity(0.75f);
+            target_->DrawTextW(countBuf, static_cast<UINT32>(wcslen(countBuf)),
+                               smallTextFormat_.Get(), countRect, mutedBrush_.Get(),
+                               D2D1_DRAW_TEXT_OPTIONS_NONE);
+            smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
+
+        DrawTrayBinButton(clearBox, total > 0,
+                          g_hoveredClipboardAction.load(std::memory_order_relaxed) == -2);
+
+        const float listTop = rect.top + FileTrayLayout::kListTop * scale;
+        const float listBottom = rect.bottom - FileTrayLayout::kListBottomInset * scale;
+
+        if (state.clipboardHistory.empty()) {
+            const D2D1_RECT_F emptyRect = D2D1::RectF(rect.left + padX, listTop,
+                                                      rect.right - padX, listBottom);
+            if (textFormat_) {
+                textFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                const wchar_t* hint = Loc(L"Clipboard is empty (Ctrl+C to copy)");
+                mutedBrush_->SetOpacity(0.75f);
+                target_->DrawTextW(hint, static_cast<UINT32>(wcslen(hint)), textFormat_.Get(),
+                                   emptyRect, mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+                textFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            }
+            return;
+        }
+
+        const float rowH = 32.0f * scale;
+        const float rowGap = 6.0f * scale;
+        const int capacity = std::max(1, static_cast<int>((listBottom - listTop + rowGap) / (rowH + rowGap)));
+
+        const int maxScroll = (static_cast<int>(total) > capacity) ? (static_cast<int>(total) - capacity) : 0;
+        int scrollOffset = g_clipboardScroll.load(std::memory_order_relaxed);
+        if (scrollOffset < 0) scrollOffset = 0;
+        if (scrollOffset > maxScroll) scrollOffset = maxScroll;
+
+        int drawn = 0;
+        for (size_t i = static_cast<size_t>(scrollOffset); i < total && drawn < capacity; ++i, ++drawn) {
+            const ClipboardHistoryItem& item = state.clipboardHistory[i];
+            const float rowTop = listTop + drawn * (rowH + rowGap);
+            const D2D1_RECT_F row = D2D1::RectF(rect.left + padX, rowTop, rect.right - padX, rowTop + rowH);
+
+            const bool hovered = (g_hoveredClipboardRow.load(std::memory_order_relaxed) == drawn);
+            DrawCard(row, 8.0f * scale, hovered);
+
+            // Icon / Preview thumbnail on the left
+            const float thumbSz = 22.0f * scale;
+            const float thumbCy = (row.top + row.bottom) * 0.5f;
+            const D2D1_RECT_F iconRect = D2D1::RectF(row.left + 8.0f * scale, thumbCy - thumbSz * 0.5f,
+                                                     row.left + 8.0f * scale + thumbSz, thumbCy + thumbSz * 0.5f);
+
+            if (item.isImage && item.imagePreview) {
+                DrawPixels(*item.imagePreview, iconRect, 1.0f);
+            } else if (item.appIcon) {
+                DrawPixels(*item.appIcon, iconRect, 0.95f);
+            } else if (iconFormat_) {
+                accentBrush_->SetOpacity(0.85f);
+                const wchar_t* glyph = L"\uE8C8"; // Clipboard icon
+                target_->DrawTextW(glyph, 1, iconFormat_.Get(), iconRect, accentBrush_.Get(),
+                                   D2D1_DRAW_TEXT_OPTIONS_NONE);
+                accentBrush_->SetOpacity(1.0f);
+            }
+
+            // Text content
+            const float textLeft = iconRect.right + 10.0f * scale;
+            const float textRight = row.right - 28.0f * scale;
+            const D2D1_RECT_F textRect = D2D1::RectF(textLeft, row.top + 3.0f * scale,
+                                                     textRight, row.bottom - 3.0f * scale);
+
+            if (textFormat_) {
+                textBrush_->SetOpacity(hovered ? 1.0f : 0.90f);
+                const std::wstring& disp = item.isImage ? Loc(L"Image copied") : item.text;
+                target_->DrawTextW(disp.c_str(), static_cast<UINT32>(disp.size()),
+                                   textFormat_.Get(), textRect, textBrush_.Get(),
+                                   D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            }
+
+            // Paste hint glyph on the right of the row
+            if (iconFormat_) {
+                const D2D1_RECT_F pasteGlyphRect = D2D1::RectF(row.right - 24.0f * scale, row.top,
+                                                               row.right - 6.0f * scale, row.bottom);
+                mutedBrush_->SetOpacity(hovered ? 0.95f : 0.40f);
+                const wchar_t* pasteGlyph = L"\uE8D2"; // Paste / copy symbol
+                target_->DrawTextW(pasteGlyph, 1, iconFormat_.Get(), pasteGlyphRect,
+                                   mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+            }
+        }
     }
 
         // Karaoke effect: a soft wave rides the wipe boundary across the active line.
@@ -15961,10 +16149,10 @@ class Renderer {
             t = Clamp(t, 0.0f, 1.0f);
             return t * t * (3.0f - 2.0f * t);
         };
-        // Height-driven, like the media surface: collapsed content is gone by
-        // ~70px, expanded content starts at ~56px and is solid by ~120px.
-        const float collapsedAlpha = SmoothFade((70.0f - dashHeight) / 30.0f);
-        const float expandedAlpha = SmoothFade((dashHeight - 56.0f) / 64.0f);
+        // Separated thresholds: collapsed UI fades out completely by 52px,
+        // and expanded UI begins at 56px, eliminating any cross-bleeding between states.
+        const float collapsedAlpha = SmoothFade((52.0f - dashHeight) / 18.0f);
+        const float expandedAlpha = SmoothFade((dashHeight - 56.0f) / 60.0f);
 
         ID2D1Layer* dashFadeLayer = AcquireLayer();
 
@@ -16072,6 +16260,7 @@ class Renderer {
             if (settings.weather) activeTabs.push_back(1);
             if (settings.hardwareMonitorModule) activeTabs.push_back(2);
             if (settings.fileTrayModule) activeTabs.push_back(4);
+            if (settings.clipboard) activeTabs.push_back(6);
 
             int maxTabs = static_cast<int>(activeTabs.size());
             int tabIdx = NormalizedTabIndex(settings);
@@ -16092,6 +16281,7 @@ class Renderer {
                 else if (activeTabId == 1) DrawWeatherDashboard(state, fullRect, settings, now, scale, hasWeather, wIcon, wText);
                 else if (activeTabId == 2) DrawHardwareMonitorDashboard(state, fullRect, settings, scale);
                 else if (activeTabId == 4) DrawFileTrayDashboard(state, fullRect, settings, scale);
+                else if (activeTabId == 6) DrawClipboardHistoryDashboard(state, fullRect, settings, scale);
             });
 
             DrawTabPagination(fullRect, maxTabs);
@@ -16646,6 +16836,7 @@ class Renderer {
             if (settings.weather) activeTabs.push_back(2);
             if (settings.hardwareMonitorModule) activeTabs.push_back(3);
             if (settings.fileTrayModule) activeTabs.push_back(4);
+            if (settings.clipboard) activeTabs.push_back(6);
             if (settings.lyrics && !lyricsFirst) activeTabs.push_back(5);  // Lyrics (last)
 
             // Same settings object as the list above, so the index can't be
@@ -16902,6 +17093,8 @@ class Renderer {
                 DrawHardwareMonitorDashboard(state, rect, settings, 1.0f);
             } else if (activeTabId == 4) {
                 DrawFileTrayDashboard(state, rect, settings, 1.0f);
+            } else if (activeTabId == 6) {
+                DrawClipboardHistoryDashboard(state, rect, settings, 1.0f);
             } else if (activeTabId == 5) {
                 // Laid out at the final expanded size and pinned to the top, so growing
                 // the island only reveals the lyrics instead of sliding them around.
@@ -21804,11 +21997,26 @@ DWORD g_keyboardThreadId = 0;
 // thread, after checking the setting. Nothing is lost by only posting.
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
+        auto* kbd = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
         if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
             g_companionEyes.lastTypingTime = NowSeconds();
+            // Long-press Ctrl+C detection for Clipboard History
+            if (kbd->vkCode == 'C' && (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+                if (g_ctrlCDownTime.load() == 0.0) {
+                    g_ctrlCDownTime.store(NowSeconds());
+                    g_ctrlCHistoryTriggered.store(false);
+                    HWND fg = GetForegroundWindow();
+                    if (fg && fg != g_hwnd) {
+                        g_prevClipboardWindow = fg;
+                    }
+                }
+            }
         }
         if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
-            auto* kbd = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+            if (kbd->vkCode == 'C' || kbd->vkCode == VK_CONTROL) {
+                g_ctrlCDownTime.store(0.0);
+                g_ctrlCHistoryTriggered.store(false);
+            }
             if (kbd->vkCode == VK_CAPITAL || kbd->vkCode == VK_NUMLOCK) {
                 const bool capsOn = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
                 const bool numOn = (GetKeyState(VK_NUMLOCK) & 0x0001) != 0;
@@ -21827,7 +22035,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 // hook exists solely to notice Caps Lock and Num Lock for the indicator pill;
 // with that module off it was still running for nothing.
 static bool CapsLockHookWanted() {
-    return g_settings.capsLock || g_settings.companionEyes;
+    return g_settings.capsLock || g_settings.companionEyes || g_settings.clipboard;
 }
 
 // Wakes the keyboard thread so it re-evaluates whether the hook is needed.
@@ -22239,8 +22447,7 @@ void LoadFileTray() {
 }
 
 bool TrayModuleEnabled() {
-    std::lock_guard lock(g_settingsMutex);
-    return g_settings.fileTrayModule;
+    return true;
 }
 
 void AddPathsToFileTrayCore(const std::vector<std::wstring>& paths) {
@@ -22323,23 +22530,48 @@ bool ExtractDropPaths(IDataObject* data, std::vector<std::wstring>* out) {
     }
     FORMATETC fmt = {CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
     STGMEDIUM medium = {};
-    if (FAILED(data->GetData(&fmt, &medium))) {
-        return false;
+    if (SUCCEEDED(data->GetData(&fmt, &medium))) {
+        // An HDROP is just the HGLOBAL; DragQueryFile locks it itself.
+        HDROP drop = reinterpret_cast<HDROP>(medium.hGlobal);
+        const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        for (UINT i = 0; i < count; ++i) {
+            const UINT len = DragQueryFileW(drop, i, nullptr, 0);
+            if (len == 0) {
+                continue;
+            }
+            std::wstring path(len, L'\0');
+            DragQueryFileW(drop, i, path.data(), len + 1);
+            out->push_back(std::move(path));
+        }
+        ReleaseStgMedium(&medium);
+        if (!out->empty()) return true;
     }
 
-    // An HDROP is just the HGLOBAL; DragQueryFile locks it itself.
-    HDROP drop = reinterpret_cast<HDROP>(medium.hGlobal);
-    const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
-    for (UINT i = 0; i < count; ++i) {
-        const UINT len = DragQueryFileW(drop, i, nullptr, 0);
-        if (len == 0) {
-            continue;
+    // Fallback: Shell IDList Array (Explorer items)
+    static const CLIPFORMAT cfShellIdList = static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_SHELLIDLIST));
+    FORMATETC fmtIdList = {cfShellIdList, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    STGMEDIUM mediumIdList = {};
+    if (SUCCEEDED(data->GetData(&fmtIdList, &mediumIdList))) {
+        LPIDA pida = reinterpret_cast<LPIDA>(GlobalLock(mediumIdList.hGlobal));
+        if (pida) {
+            LPCITEMIDLIST pidlFolder = reinterpret_cast<LPCITEMIDLIST>(reinterpret_cast<BYTE*>(pida) + pida->aoffset[0]);
+            for (UINT i = 1; i <= pida->cidl; ++i) {
+                LPCITEMIDLIST pidlRel = reinterpret_cast<LPCITEMIDLIST>(reinterpret_cast<BYTE*>(pida) + pida->aoffset[i]);
+                PIDLIST_ABSOLUTE pidlFull = ILCombine(pidlFolder, pidlRel);
+                if (pidlFull) {
+                    wchar_t path[MAX_PATH] = {};
+                    if (SHGetPathFromIDListW(pidlFull, path)) {
+                        out->push_back(path);
+                    }
+                    ILFree(pidlFull);
+                }
+            }
+            GlobalUnlock(mediumIdList.hGlobal);
         }
-        std::wstring path(len, L'\0');
-        DragQueryFileW(drop, i, path.data(), len + 1);
-        out->push_back(std::move(path));
+        ReleaseStgMedium(&mediumIdList);
+        if (!out->empty()) return true;
     }
-    ReleaseStgMedium(&medium);
+
     return !out->empty();
 }
 
@@ -22472,19 +22704,18 @@ void PasteIntoFileTray(HWND hwnd) {
 }
 
 DWORD PickTrayDropEffect(DWORD allowed) {
-    // The tray only references files, so never ask the source to move them.
     if (allowed & DROPEFFECT_COPY) return DROPEFFECT_COPY;
     if (allowed & DROPEFFECT_LINK) return DROPEFFECT_LINK;
-    return DROPEFFECT_NONE;
+    if (allowed & DROPEFFECT_MOVE) return DROPEFFECT_COPY; // Accept as copy reference
+    return DROPEFFECT_COPY;
 }
 
-// For non-file drags (browser images / links / text). Nothing is ever deleted from
-// the source for these, so MOVE is harmless and some apps only offer it.
+// For non-file drags (browser images / links / text).
 DWORD PickTrayDropEffectAny(DWORD allowed) {
     if (allowed & DROPEFFECT_COPY) return DROPEFFECT_COPY;
     if (allowed & DROPEFFECT_LINK) return DROPEFFECT_LINK;
-    if (allowed & DROPEFFECT_MOVE) return DROPEFFECT_MOVE;
-    return DROPEFFECT_NONE;
+    if (allowed & DROPEFFECT_MOVE) return DROPEFFECT_COPY;
+    return DROPEFFECT_COPY;
 }
 
 // ── Non-Explorer drops (Brave / Chrome / Edge / Firefox ...) ─────────────────
@@ -22512,12 +22743,36 @@ bool TrayDataAcceptable(IDataObject* data, bool* realFiles) {
         *realFiles = true;
         return true;
     }
+    static const CLIPFORMAT cfShellIdList = static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_SHELLIDLIST));
+    fmt.cfFormat = cfShellIdList;
+    if (data->QueryGetData(&fmt) == S_OK) {
+        *realFiles = true;
+        return true;
+    }
     fmt.cfFormat = TrayFmtFileDescriptorW();      // images dragged out of a browser
     if (data->QueryGetData(&fmt) == S_OK) return true;
     fmt.cfFormat = TrayFmtInetUrlW();             // dragged links
     if (data->QueryGetData(&fmt) == S_OK) return true;
     fmt.cfFormat = CF_UNICODETEXT;                // dragged text selections
     if (data->QueryGetData(&fmt) == S_OK) return true;
+    fmt.cfFormat = CF_TEXT;
+    if (data->QueryGetData(&fmt) == S_OK) return true;
+
+    // Fallback: enumerate available formats from the IDataObject
+    ComPtr<IEnumFORMATETC> enumFmt;
+    if (SUCCEEDED(data->EnumFormatEtc(DATADIR_GET, enumFmt.GetAddressOf())) && enumFmt) {
+        FORMATETC f = {};
+        while (enumFmt->Next(1, &f, nullptr) == S_OK) {
+            if (f.cfFormat == CF_HDROP || f.cfFormat == cfShellIdList) {
+                *realFiles = true;
+                return true;
+            }
+            if (f.cfFormat == TrayFmtFileDescriptorW() || f.cfFormat == TrayFmtInetUrlW() ||
+                f.cfFormat == CF_UNICODETEXT || f.cfFormat == CF_TEXT) {
+                return true;
+            }
+        }
+    }
     return false;
 }
 
@@ -22772,6 +23027,7 @@ class TrayDropTarget final : public IDropTarget {
             if (tab >= 0) {
                 g_idleTab = tab;
             }
+            g_trayAutoPinned = true;
             g_clickExpanded = true;
             g_layoutDirty = true;
             TriggerNudge();
@@ -22877,10 +23133,39 @@ void StartFileTrayDrag(const std::wstring& path) {
     g_hoveredFileTrayAction = -1;
     g_layoutDirty = true;
 
-    // File was moved away by the target: its tray entry is now stale.
-    if (effect != DROPEFFECT_NONE && GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    // File was dropped or moved into target: remove from temporary shelf
+    if (effect != DROPEFFECT_NONE) {
         RemoveFileTrayItemByPath(path);
+        size_t remaining = 0;
+        {
+            std::lock_guard lock(g_stateMutex);
+            remaining = g_state.fileTrayItems.size();
+        }
+        if (remaining == 0) {
+            g_trayAutoPinned = false;
+            g_clickExpanded = false;
+            TriggerNudge();
+        }
     }
+}
+
+void SimulateCtrlV(HWND targetWnd) {
+    if (targetWnd && IsWindow(targetWnd)) {
+        SetForegroundWindow(targetWnd);
+        Sleep(25);
+    }
+    INPUT inputs[4] = {};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_CONTROL;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = 'V';
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = 'V';
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = VK_CONTROL;
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(4, inputs, sizeof(INPUT));
 }
 
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -23025,6 +23310,17 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
 
+        case WM_APP_OPEN_CLIPBOARD_HISTORY: {
+            const int tab = ClipboardHistoryTabIndex(GetSettingsCopy());
+            if (tab >= 0) {
+                g_idleTab = tab;
+            }
+            g_clickExpanded = true;
+            g_layoutDirty = true;
+            TriggerNudge();
+            return 0;
+        }
+
         case WM_DEVICECHANGE: {
             // DBT_DEVICEARRIVAL = 0x8000, DBT_DEVICEREMOVECOMPLETE = 0x8004
             if (wParam == 0x8000 || wParam == 0x8004) {
@@ -23089,7 +23385,14 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             // is clickable; everything else falls through to the windows below.
             if (g_pillClientRect.valid) {
                 const PillClientRect& r = g_pillClientRect;
-                if (pt.x < r.left || pt.x > r.right || pt.y < r.top || pt.y > r.bottom) {
+                const bool isDragging = (GetKeyState(VK_LBUTTON) & 0x8000) != 0;
+                int padX = 0;
+                int padY = 0;
+                if (isDragging && g_settings.fileTrayModule) {
+                    padX = static_cast<int>(120.0f * g_settings.sizeScale);
+                    padY = static_cast<int>(80.0f * g_settings.sizeScale);
+                }
+                if (pt.x < r.left - padX || pt.x > r.right + padX || pt.y < r.top - 20 || pt.y > r.bottom + padY) {
                     return HTTRANSPARENT;
                 }
                 return HTCLIENT;
@@ -23356,6 +23659,38 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_layoutDirty = true;
             }
 
+            // Clipboard History hover: row highlight plus bin button.
+            int clipHoverRow = -1;
+            int clipHoverAction = -1;
+            if (g_settings.clipboard && currentTab == ClipboardHistoryTabIndex(g_settings)) {
+                size_t clipCount = 0;
+                {
+                    std::lock_guard lock(g_stateMutex);
+                    clipCount = g_state.clipboardHistory.size();
+                }
+                const MediaContentPoint cp = MediaContentFromClient(xPos, yPos);
+                if (cp.valid) {
+                    if (clipCount > 0 && FileTrayClearHitTest(cp)) {
+                        clipHoverAction = -2;
+                    } else {
+                        const float listTop = FileTrayLayout::kListTop;
+                        const float rowH = 32.0f;
+                        const float rowGap = 6.0f;
+                        if (cp.y >= listTop && cp.x >= FileTrayLayout::kPadX && cp.x <= cp.width - FileTrayLayout::kPadX) {
+                            const int rIdx = static_cast<int>((cp.y - listTop) / (rowH + rowGap));
+                            const int capacity = std::max(1, static_cast<int>((cp.height - 16.0f - listTop + rowGap) / (rowH + rowGap)));
+                            if (rIdx >= 0 && rIdx < capacity) {
+                                clipHoverRow = rIdx;
+                            }
+                        }
+                    }
+                }
+            }
+            if (g_hoveredClipboardRow.exchange(clipHoverRow) != clipHoverRow ||
+                g_hoveredClipboardAction.exchange(clipHoverAction) != clipHoverAction) {
+                g_layoutDirty = true;
+            }
+
             // Pressed on a row and moved past the system drag threshold: pick the file up.
             if (s_trayPressActive) {
                 if (!(wParam & MK_LBUTTON)) {
@@ -23386,6 +23721,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_layoutDirty = true;
             }
             if (g_hoveredFileTrayAction.exchange(-1) != -1) {
+                g_layoutDirty = true;
+            }
+            if (g_hoveredClipboardRow.exchange(-1) != -1 || g_hoveredClipboardAction.exchange(-1) != -1) {
                 g_layoutDirty = true;
             }
             return 0;
@@ -23568,6 +23906,16 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         SaveFileTray();
                         g_hoveredFileTrayRow = -1;
                         g_hoveredFileTrayAction = -1;
+                        size_t remaining = 0;
+                        {
+                            std::lock_guard lock(g_stateMutex);
+                            remaining = g_state.fileTrayItems.size();
+                        }
+                        if (remaining == 0) {
+                            g_trayAutoPinned = false;
+                            g_clickExpanded = false;
+                            TriggerNudge();
+                        }
                         g_layoutDirty = true;
                         return 0;
                     }
@@ -23585,6 +23933,54 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     }
                     // A click on the empty shelf should not fall through to
                     // "focus the media app".
+                    return 0;
+                }
+
+                if (g_settings.clipboard && currentTab == ClipboardHistoryTabIndex(g_settings)) {
+                    if (cp.valid) {
+                        if (FileTrayClearHitTest(cp)) {
+                            {
+                                std::lock_guard lock(g_stateMutex);
+                                g_state.clipboardHistory.clear();
+                            }
+                            g_hoveredClipboardRow = -1;
+                            g_hoveredClipboardAction = -1;
+                            g_layoutDirty = true;
+                            return 0;
+                        }
+                        const float listTop = FileTrayLayout::kListTop;
+                        const float rowH = 32.0f;
+                        const float rowGap = 6.0f;
+                        if (cp.y >= listTop && cp.x >= FileTrayLayout::kPadX && cp.x <= cp.width - FileTrayLayout::kPadX) {
+                            const int rIdx = static_cast<int>((cp.y - listTop) / (rowH + rowGap));
+                            const int scrollOffset = g_clipboardScroll.load(std::memory_order_relaxed);
+                            const size_t index = static_cast<size_t>(scrollOffset + rIdx);
+
+                            ClipboardHistoryItem toPaste;
+                            bool havePaste = false;
+                            {
+                                std::lock_guard lock(g_stateMutex);
+                                if (index < g_state.clipboardHistory.size()) {
+                                    toPaste = g_state.clipboardHistory[index];
+                                    havePaste = true;
+                                }
+                            }
+                            if (havePaste) {
+                                if (!toPaste.isImage && !toPaste.fullText.empty()) {
+                                    CopyTextToClipboard(hwnd, toPaste.fullText);
+                                }
+                                g_clickExpanded = false;
+                                g_layoutDirty = true;
+                                TriggerNudge();
+
+                                HWND prev = g_prevClipboardWindow;
+                                if (prev && IsWindow(prev)) {
+                                    SimulateCtrlV(prev);
+                                }
+                                return 0;
+                            }
+                        }
+                    }
                     return 0;
                 }
 
@@ -23719,6 +24115,23 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         return 0;
                     }
                     s_trayWheelAccum = 0;  // fresh gesture at the edge: fall through to tab switching
+                }
+            }
+
+            if (g_settings.clipboard && NormalizedTabIndex(g_settings) == ClipboardHistoryTabIndex(g_settings)) {
+                size_t clipCount = 0;
+                {
+                    std::lock_guard lock(g_stateMutex);
+                    clipCount = g_state.clipboardHistory.size();
+                }
+                if (clipCount > 3) {
+                    const int dir = delta > 0 ? -1 : 1;
+                    int cur = g_clipboardScroll.load(std::memory_order_relaxed);
+                    int maxSc = static_cast<int>(clipCount) - 3;
+                    cur = ClampInt(cur + dir, 0, maxSc);
+                    g_clipboardScroll.store(cur);
+                    g_layoutDirty = true;
+                    return 0;
                 }
             }
 
@@ -24163,7 +24576,15 @@ DWORD WINAPI RenderThreadProc(void*) {
             secondary = ActivityForKind(kinds[1], g_settings, snapshot);
         }
 
-        const bool pinned = g_pinnedExpanded.load();
+        // Check long-press Ctrl+C (>= 350ms) to open Clipboard History
+        const double ctrlCDown = g_ctrlCDownTime.load();
+        if (ctrlCDown > 0.0 && !g_ctrlCHistoryTriggered.load() && (now - ctrlCDown >= 0.35)) {
+            g_ctrlCHistoryTriggered.store(true);
+            PostMessageW(hwnd, WM_APP_OPEN_CLIPBOARD_HISTORY, 0, 0);
+        }
+
+        const bool traySticky = g_trayAutoPinned.load() && !snapshot.fileTrayItems.empty();
+        const bool pinned = g_pinnedExpanded.load() || traySticky;
 
         if (primary.kind != previousPrimary) {
             if (primary.kind != IslandKind::Idle &&
@@ -24224,7 +24645,7 @@ DWORD WINAPI RenderThreadProc(void*) {
 
         bool needsRender = false;
 
-        if (!hover && g_clickExpanded.load()) {
+        if (!hover && g_clickExpanded.load() && !traySticky) {
             g_clickExpanded = false;
             needsRender = true;
         }
@@ -24270,6 +24691,9 @@ DWORD WINAPI RenderThreadProc(void*) {
         }
 
         bool isHoverExpanded = g_settings.expandOnHover ? hover : (hover && g_clickExpanded.load());
+        if (traySticky) {
+            isHoverExpanded = true;
+        }
         const bool gameMetricsPresent = primary.kind == IslandKind::Idle &&
             (g_settings.gameOverlay || g_gameOverlayPinned.load());
         if (gameMetricsPresent) {
