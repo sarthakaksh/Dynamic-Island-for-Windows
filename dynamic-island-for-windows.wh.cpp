@@ -12024,13 +12024,15 @@ struct CompanionEyesState {
     double blinkStartTime = 0.0;
     float hoverHappy = 0.0f;
 
-    // 1. Dizzy Roll
+    // 1. Dizzy Shake Detection & Roll
     POINT prevMousePt = {};
     double lastMouseCheck = 0.0;
-    float shakeAccum = 0.0f;
-    double lastShakeDirChange = 0.0;
-    float lastMouseDx = 0.0f;
-    float lastMouseDy = 0.0f;
+    float strokeAccumX = 0.0f;
+    float strokeAccumY = 0.0f;
+    int currentStrokeDirX = 0;
+    int currentStrokeDirY = 0;
+    int shakeReversalCount = 0;
+    double lastReversalTime = 0.0;
     double dizzyEndTime = 0.0;
 
     // 2. Typing Peek
@@ -13506,6 +13508,10 @@ class Renderer {
             // An opaque fill would hide the backdrop, so cap it.
             bg.a = std::min(bg.a, settings.backdropFillAlpha);
         }
+        // Ensure tai thỏ (Notch) has a deep, solid Obsidian black tone that doesn't wash out:
+        if (useNotchShape) {
+            bg.a = std::max(bg.a, 0.98f * settingsOpacity_);
+        }
         if (ID2D1SolidColorBrush* fillBrush = AcquireBrush(bg)) {
             FillIslandShape(rect, radius, settings.w11Style, useNotchShape, fillBrush);
         }
@@ -13521,14 +13527,18 @@ class Renderer {
             FillAccentBloom(rect, radius, bloom * settings.accentBloom);
         }
 
-        // 7. Ambient Breathing Glow:
-        // Gentle rhythmic aura pulsating along the contour in idle/companion mode
+        // 7. Ambient Breathing Glow & High-Definition Contour for Tai Thỏ (Notch):
+        // Prominent cyber aura and sharp contour border along the notch edges
         if (settings.companionEyes && useNotchShape) {
             double now = NowSeconds();
             const float breath = 0.5f + 0.5f * sinf(static_cast<float>(now * 1.8)); // 3.5s smooth breathing cycle
-            const float glowAlpha = (0.04f + 0.07f * breath) * settingsOpacity_;
+            const float glowAlpha = (0.10f + 0.14f * breath) * settingsOpacity_;
             if (ID2D1SolidColorBrush* breathBrush = AcquireBrush(D2D1::ColorF(0.0f, 0.72f, 1.0f, glowAlpha))) {
-                DrawIslandShape(rect, radius, false, true, breathBrush, 1.8f * settings.sizeScale);
+                DrawIslandShape(rect, radius, false, true, breathBrush, 2.0f * settings.sizeScale);
+            }
+            // Crisp, bold contour border for tai thỏ:
+            if (ID2D1SolidColorBrush* notchBorder = AcquireBrush(D2D1::ColorF(0.24f, 0.24f, 0.28f, 0.90f * settingsOpacity_))) {
+                DrawIslandShape(rect, radius, false, true, notchBorder, 1.0f * settings.sizeScale);
             }
         }
 
@@ -15722,28 +15732,69 @@ class Renderer {
         g_companionEyes.prevMousePt = mousePt;
 
         // Dizzy Shake Detection:
-        // Must detect rapid zigzag reversals (wiggle / shake).
-        // Moving mouse across the screen (even very fast) has NO reversal and will NEVER trigger dizzy!
-        if (mouseDt > 0.001 && mouseDt < 0.1) {
-            float curSpeed = sqrtf(mouseDeltaX * mouseDeltaX + mouseDeltaY * mouseDeltaY) / static_cast<float>(mouseDt);
-            if (curSpeed > 1800.0f) {
-                bool reversedX = (mouseDeltaX > 32.0f && g_companionEyes.lastMouseDx < -32.0f) ||
-                                 (mouseDeltaX < -32.0f && g_companionEyes.lastMouseDx > 32.0f);
-                bool reversedY = (mouseDeltaY > 32.0f && g_companionEyes.lastMouseDy < -32.0f) ||
-                                 (mouseDeltaY < -32.0f && g_companionEyes.lastMouseDy > 32.0f);
-                if (reversedX || reversedY) {
-                    g_companionEyes.shakeAccum += 1.0f;
-                    g_companionEyes.lastShakeDirChange = now;
+        // Must detect rapid zigzag reversals (wiggle / shake across >= 14px strokes).
+        // Highly responsive and works reliably across 60Hz, 120Hz, 144Hz, 240Hz, 360Hz+.
+        if (mouseDt > 0.0005 && mouseDt < 0.15) {
+            if (now - g_companionEyes.lastReversalTime > 1.2) {
+                g_companionEyes.shakeReversalCount = 0;
+            }
+
+            // X-axis shake detection:
+            if (mouseDeltaX > 1.0f) {
+                if (g_companionEyes.currentStrokeDirX < 0 && g_companionEyes.strokeAccumX < -14.0f) {
+                    g_companionEyes.shakeReversalCount++;
+                    g_companionEyes.lastReversalTime = now;
+                    g_companionEyes.strokeAccumX = 0.0f;
+                    g_companionEyes.currentStrokeDirX = 1;
+                } else if (g_companionEyes.currentStrokeDirX <= 0) {
+                    g_companionEyes.currentStrokeDirX = 1;
+                    g_companionEyes.strokeAccumX = 0.0f;
                 }
-                g_companionEyes.lastMouseDx = mouseDeltaX;
-                g_companionEyes.lastMouseDy = mouseDeltaY;
+                g_companionEyes.strokeAccumX += mouseDeltaX;
+            } else if (mouseDeltaX < -1.0f) {
+                if (g_companionEyes.currentStrokeDirX > 0 && g_companionEyes.strokeAccumX > 14.0f) {
+                    g_companionEyes.shakeReversalCount++;
+                    g_companionEyes.lastReversalTime = now;
+                    g_companionEyes.strokeAccumX = 0.0f;
+                    g_companionEyes.currentStrokeDirX = -1;
+                } else if (g_companionEyes.currentStrokeDirX >= 0) {
+                    g_companionEyes.currentStrokeDirX = -1;
+                    g_companionEyes.strokeAccumX = 0.0f;
+                }
+                g_companionEyes.strokeAccumX += mouseDeltaX;
             }
-            if (now - g_companionEyes.lastShakeDirChange > 0.4) {
-                g_companionEyes.shakeAccum *= 0.70f;
+
+            // Y-axis shake detection:
+            if (mouseDeltaY > 1.0f) {
+                if (g_companionEyes.currentStrokeDirY < 0 && g_companionEyes.strokeAccumY < -14.0f) {
+                    g_companionEyes.shakeReversalCount++;
+                    g_companionEyes.lastReversalTime = now;
+                    g_companionEyes.strokeAccumY = 0.0f;
+                    g_companionEyes.currentStrokeDirY = 1;
+                } else if (g_companionEyes.currentStrokeDirY <= 0) {
+                    g_companionEyes.currentStrokeDirY = 1;
+                    g_companionEyes.strokeAccumY = 0.0f;
+                }
+                g_companionEyes.strokeAccumY += mouseDeltaY;
+            } else if (mouseDeltaY < -1.0f) {
+                if (g_companionEyes.currentStrokeDirY > 0 && g_companionEyes.strokeAccumY > 14.0f) {
+                    g_companionEyes.shakeReversalCount++;
+                    g_companionEyes.lastReversalTime = now;
+                    g_companionEyes.strokeAccumY = 0.0f;
+                    g_companionEyes.currentStrokeDirY = -1;
+                } else if (g_companionEyes.currentStrokeDirY >= 0) {
+                    g_companionEyes.currentStrokeDirY = -1;
+                    g_companionEyes.strokeAccumY = 0.0f;
+                }
+                g_companionEyes.strokeAccumY += mouseDeltaY;
             }
-            if (g_companionEyes.shakeAccum >= 5.0f) {
-                g_companionEyes.dizzyEndTime = now + 2.0; // dizzy for 2 seconds
-                g_companionEyes.shakeAccum = 0.0f;
+
+            // 4 rapid reversals within 1.2s triggers Dizzy!
+            if (g_companionEyes.shakeReversalCount >= 4) {
+                g_companionEyes.dizzyEndTime = now + 3.0; // Dizzy for 3 seconds
+                g_companionEyes.shakeReversalCount = 0;
+                g_companionEyes.strokeAccumX = 0.0f;
+                g_companionEyes.strokeAccumY = 0.0f;
             }
         }
 
@@ -15837,10 +15888,10 @@ class Renderer {
 
         // Dizzy Roll pupil swirl:
         if (isDizzy && !isDeepSleeping && !isStartled && !isAngry) {
-            const float dizzyRemain = static_cast<float>(g_companionEyes.dizzyEndTime - now) / 2.5f;
-            const float dizzyAngle = static_cast<float>(now * 15.0);
-            pupilX = cosf(dizzyAngle) * maxOffsetX * 0.95f * dizzyRemain;
-            pupilY = sinf(dizzyAngle) * maxOffsetY * 0.95f * dizzyRemain;
+            const float dizzyRemain = std::clamp(static_cast<float>(g_companionEyes.dizzyEndTime - now) / 3.0f, 0.0f, 1.0f);
+            const float dizzyPhase = static_cast<float>(now * 9.5);
+            pupilX = cosf(dizzyPhase) * 3.6f * scale * dizzyRemain;
+            pupilY = sinf(dizzyPhase * 0.85f) * 2.4f * scale * dizzyRemain;
         } else if (isStartled) {
             pupilX += sinf(static_cast<float>(now * 52.0)) * 1.8f * scale;
             pupilY += cosf(static_cast<float>(now * 47.0)) * 1.5f * scale;
@@ -15895,6 +15946,9 @@ class Renderer {
 
         if (isDeepSleeping) {
             baseEyeH = 0.0f; // Peaceful sleeping closed eyelid
+        } else if (isDizzy) {
+            baseEyeW *= 1.25f; // Wide, expressive reeling dizzy eyes
+            baseEyeH *= 1.15f;
         } else if (isStartled) {
             baseEyeW *= 1.45f; // Shocked wide open
             baseEyeH *= 1.45f;
@@ -15929,8 +15983,66 @@ class Renderer {
 
             float currentH = baseEyeH * blinkRatio;
 
-            // Closed eye (Deep Sleep, Blink, or Happy Charging Crescent):
-            if (forceHappyCrescent || isDeepSleeping || currentH < 2.0f * scale) {
+            // 1. Dizzy Expression: Hypnotic Spinning Archimedean Spirals (@ @)
+            if (isDizzy && !isDeepSleeping && !forceHappyCrescent) {
+                EnsureRoundJoinStyle();
+
+                // Luminous dizzy aura bloom around eye
+                if (ID2D1SolidColorBrush* dizzyAura3 = AcquireBrush(D2D1::ColorF(0.30f, 0.60f, 1.0f, 0.28f * settingsOpacity_))) {
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW + 9.0f * scale, currentH + 9.0f * scale), dizzyAura3);
+                }
+                if (ID2D1SolidColorBrush* dizzyAura2 = AcquireBrush(D2D1::ColorF(0.45f, 0.75f, 1.0f, 0.45f * settingsOpacity_))) {
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW + 4.5f * scale, currentH + 4.5f * scale), dizzyAura2);
+                }
+
+                // Dark eye backdrop for high contrast spiral
+                if (ID2D1SolidColorBrush* darkBackdrop = AcquireBrush(D2D1::ColorF(0.02f, 0.05f, 0.10f, 0.95f * settingsOpacity_))) {
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW, currentH), darkBackdrop);
+                }
+
+                // Outer eye rim
+                if (ID2D1SolidColorBrush* rimBrush = AcquireBrush(D2D1::ColorF(0.20f, 0.70f, 1.0f, 0.90f * settingsOpacity_))) {
+                    target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW, currentH), rimBrush, 1.4f * scale);
+                }
+
+                // Hypnotic Spinning Archimedean Spiral (@):
+                // Left eye rotates clockwise; right eye rotates counter-clockwise
+                const float spin = static_cast<float>(now * (isLeft ? 12.0 : -12.0));
+                ComPtr<ID2D1PathGeometry> spiralGeom;
+                if (SUCCEEDED(d2dFactory_->CreatePathGeometry(&spiralGeom))) {
+                    ComPtr<ID2D1GeometrySink> sink;
+                    if (SUCCEEDED(spiralGeom->Open(&sink))) {
+                        const float maxR = baseEyeW * 0.88f;
+                        const float hRatio = std::max(0.6f, currentH / std::max(1.0f, baseEyeW));
+                        const int kSteps = 28;
+                        sink->BeginFigure(D2D1::Point2F(eyeCenterX, eyeCenterY), D2D1_FIGURE_BEGIN_HOLLOW);
+                        for (int s = 1; s <= kSteps; ++s) {
+                            const float frac = static_cast<float>(s) / static_cast<float>(kSteps);
+                            const float theta = frac * (4.8f * 3.14159265f); // ~2.4 full turns
+                            const float r = frac * maxR;
+                            const float px = eyeCenterX + r * cosf(theta + spin);
+                            const float py = eyeCenterY + r * sinf(theta + spin) * hRatio;
+                            sink->AddLine(D2D1::Point2F(px, py));
+                        }
+                        sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                        sink->Close();
+
+                        if (ID2D1SolidColorBrush* spiralBrush = AcquireBrush(D2D1::ColorF(0.35f, 0.92f, 1.0f, 0.98f * settingsOpacity_))) {
+                            target_->DrawGeometry(spiralGeom.Get(), spiralBrush, 2.2f * scale, roundJoinStyle_.Get());
+                        }
+                    }
+                }
+
+                // Bright center core dot
+                if (ID2D1SolidColorBrush* dotBrush = AcquireBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.98f * settingsOpacity_))) {
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY), 2.0f * scale, 2.0f * scale), dotBrush);
+                }
+            } else if (forceHappyCrescent || isDeepSleeping || currentH < 2.0f * scale) {
+                // Closed eye (Deep Sleep, Blink, or Happy Charging Crescent):
                 D2D1_COLOR_F arcCol = isHappyCharging ? D2D1::ColorF(0.2f, 1.0f, 0.7f, 0.98f) : D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.95f);
                 if (ID2D1SolidColorBrush* lineBrush = AcquireBrush(arcCol)) {
                     const float halfW = (isDeepSleeping ? 8.2f : baseEyeW * 1.15f) * (isDeepSleeping ? scale : 1.0f);
@@ -15954,6 +16066,13 @@ class Renderer {
                             }
                             sink->EndFigure(D2D1_FIGURE_END_OPEN);
                             sink->Close();
+
+                            // Soft glowing aura around crescent arcs
+                            if (ID2D1SolidColorBrush* arcGlow = AcquireBrush(isHappyCharging ? D2D1::ColorF(0.0f, 1.0f, 0.65f, 0.35f * settingsOpacity_)
+                                                                                            : D2D1::ColorF(0.15f, 0.78f, 1.0f, 0.30f * settingsOpacity_))) {
+                                target_->DrawGeometry(arcGeom.Get(), arcGlow, (isDeepSleeping ? 4.8f : 5.2f) * scale);
+                            }
+
                             target_->DrawGeometry(arcGeom.Get(), lineBrush, (isDeepSleeping ? 2.2f : 2.5f) * scale);
                         }
                     }
@@ -16012,52 +16131,75 @@ class Renderer {
                     }
                 }
             } else {
-                // Open eye: Multi-layer luminous glowing oval
+                // Open eye: Multi-layer luminous glowing oval with radiant aura
+                const float auraPulse = 1.0f + 0.08f * sinf(static_cast<float>(now * 2.8));
 
-                // Layer 3: Outer bloom
-                D2D1_COLOR_F bloom3Col;
+                // Layer 4: Deep volumetric outer aura (vầng hào quang tỏa sáng rộng quanh mắt)
+                D2D1_COLOR_F auraFarCol;
                 if (isAngry) {
-                    bloom3Col = D2D1::ColorF(1.0f, 0.20f, 0.05f, 0.30f * settingsOpacity_);
+                    auraFarCol = D2D1::ColorF(1.0f, 0.15f, 0.02f, 0.35f * settingsOpacity_);
                 } else if (isHappyCharging) {
-                    bloom3Col = D2D1::ColorF(0.0f, 1.0f, 0.65f, 0.22f * settingsOpacity_);
+                    auraFarCol = D2D1::ColorF(0.0f, 1.0f, 0.60f, 0.32f * settingsOpacity_);
                 } else {
-                    bloom3Col = D2D1::ColorF(0.0f, 0.70f, 1.0f, 0.14f * settingsOpacity_);
+                    auraFarCol = D2D1::ColorF(0.0f, 0.65f, 1.0f, 0.28f * settingsOpacity_);
                 }
-
-                if (ID2D1SolidColorBrush* halo3 = AcquireBrush(bloom3Col)) {
+                if (ID2D1SolidColorBrush* auraFar = AcquireBrush(auraFarCol)) {
                     target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
-                                                      baseEyeW + 7.5f * scale, currentH + 7.5f * scale), halo3);
+                                                      (baseEyeW + 12.0f * scale) * auraPulse,
+                                                      (currentH + 12.0f * scale) * auraPulse), auraFar);
                 }
 
-                // Layer 2: Soft bloom
-                D2D1_COLOR_F bloom2Col = isAngry ? D2D1::ColorF(1.0f, 0.40f, 0.12f, 0.45f * settingsOpacity_)
-                                                 : D2D1::ColorF(0.85f, 0.95f, 1.0f, 0.35f * settingsOpacity_);
-                if (ID2D1SolidColorBrush* halo2 = AcquireBrush(bloom2Col)) {
+                // Layer 3: Mid luminous corona
+                D2D1_COLOR_F auraMidCol = isAngry ? D2D1::ColorF(1.0f, 0.35f, 0.08f, 0.48f * settingsOpacity_)
+                                                  : D2D1::ColorF(0.12f, 0.78f, 1.0f, 0.42f * settingsOpacity_);
+                if (ID2D1SolidColorBrush* auraMid = AcquireBrush(auraMidCol)) {
                     target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
-                                                      baseEyeW + 3.8f * scale, currentH + 3.8f * scale), halo2);
+                                                      baseEyeW + 6.5f * scale, currentH + 6.5f * scale), auraMid);
                 }
 
-                // Layer 1: Bright aura
-                const float halo1Alpha = 0.65f * settingsOpacity_;
-                if (ID2D1SolidColorBrush* halo1 = AcquireBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, halo1Alpha))) {
+                // Layer 2: Inner intense corona
+                D2D1_COLOR_F auraNearCol = isAngry ? D2D1::ColorF(1.0f, 0.60f, 0.20f, 0.68f * settingsOpacity_)
+                                                   : D2D1::ColorF(0.35f, 0.88f, 1.0f, 0.65f * settingsOpacity_);
+                if (ID2D1SolidColorBrush* auraNear = AcquireBrush(auraNearCol)) {
                     target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
-                                                      baseEyeW + 1.6f * scale, currentH + 1.6f * scale), halo1);
+                                                      baseEyeW + 2.8f * scale, currentH + 2.8f * scale), auraNear);
                 }
 
-                // Core: Brilliant solid core
-                D2D1_COLOR_F coreCol = isAngry ? D2D1::ColorF(1.0f, 0.94f, 0.88f, 1.0f * settingsOpacity_)
-                                               : D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f * settingsOpacity_);
+                // Layer 1: Saturated Eye Body (màu sắc con mắt đậm đà sắc nét)
+                D2D1_COLOR_F bodyCol = isAngry ? D2D1::ColorF(1.0f, 0.25f, 0.05f, 0.98f * settingsOpacity_)
+                                               : D2D1::ColorF(0.06f, 0.65f, 0.98f, 0.98f * settingsOpacity_);
+                if (ID2D1SolidColorBrush* bodyBrush = AcquireBrush(bodyCol)) {
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW, currentH), bodyBrush);
+                }
+
+                // Eye Contour stroke: Sharp deep rim for high definition
+                D2D1_COLOR_F contourCol = isAngry ? D2D1::ColorF(0.90f, 0.10f, 0.0f, 0.95f * settingsOpacity_)
+                                                  : D2D1::ColorF(0.0f, 0.48f, 0.90f, 0.95f * settingsOpacity_);
+                if (ID2D1SolidColorBrush* contourBrush = AcquireBrush(contourCol)) {
+                    target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW, currentH), contourBrush, 1.3f * scale);
+                }
+
+                // Core: Brilliant luminous inner core
+                D2D1_COLOR_F coreCol = isAngry ? D2D1::ColorF(1.0f, 0.92f, 0.85f, 1.0f * settingsOpacity_)
+                                               : D2D1::ColorF(0.88f, 0.97f, 1.0f, 1.0f * settingsOpacity_);
                 if (ID2D1SolidColorBrush* core = AcquireBrush(coreCol)) {
                     target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
-                                                      baseEyeW, currentH), core);
+                                                      baseEyeW * 0.72f, currentH * 0.72f), core);
                 }
 
-                // Specular reflection highlight dot
+                // Specular reflection highlights (dual dots for lively, glassy eyes)
                 if (currentH > 4.5f * scale) {
-                    if (ID2D1SolidColorBrush* spec = AcquireBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.90f * settingsOpacity_))) {
+                    if (ID2D1SolidColorBrush* spec = AcquireBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.92f * settingsOpacity_))) {
+                        // Primary highlight (top-left)
                         target_->FillEllipse(D2D1::Ellipse(
-                            D2D1::Point2F(eyeCenterX - baseEyeW * 0.28f, eyeCenterY - currentH * 0.32f),
-                            2.0f * scale, 2.2f * scale), spec);
+                            D2D1::Point2F(eyeCenterX - baseEyeW * 0.28f, eyeCenterY - currentH * 0.30f),
+                            2.1f * scale, 2.3f * scale), spec);
+                        // Secondary mini highlight (bottom-right)
+                        target_->FillEllipse(D2D1::Ellipse(
+                            D2D1::Point2F(eyeCenterX + baseEyeW * 0.25f, eyeCenterY + currentH * 0.25f),
+                            1.1f * scale, 1.1f * scale), spec);
                     }
                 }
             }
@@ -16082,6 +16224,24 @@ class Renderer {
                     // Rounded endcaps
                     target_->FillEllipse(D2D1::Ellipse(pStart, browStroke * 0.5f, browStroke * 0.5f), browBrush);
                     target_->FillEllipse(D2D1::Ellipse(pEnd, browStroke * 0.5f, browStroke * 0.5f), browBrush);
+                }
+            }
+        }
+
+        // Orbiting Dizzy Stars & Sparkles (💫) overhead when dizzy:
+        if (isDizzy && !isDeepSleeping) {
+            EnsureRoundJoinStyle();
+            for (int sIdx = 0; sIdx < 2; ++sIdx) {
+                const float starPhase = static_cast<float>(now * 4.6 + sIdx * 3.14159265);
+                const float starOrbitW = (eyeSpacing + 14.0f) * scale;
+                const float starOrbitH = 6.5f * scale;
+                const float starX = cx + cosf(starPhase) * starOrbitW;
+                const float starY = cy - 14.0f * scale + sinf(starPhase) * starOrbitH;
+                const float starR = (2.6f + 0.7f * sinf(starPhase * 2.0f)) * scale;
+
+                if (ID2D1SolidColorBrush* starBrush = AcquireBrush(D2D1::ColorF(1.0f, 0.88f, 0.25f, 0.92f * settingsOpacity_))) {
+                    target_->DrawLine(D2D1::Point2F(starX - starR, starY), D2D1::Point2F(starX + starR, starY), starBrush, 1.4f * scale, roundJoinStyle_.Get());
+                    target_->DrawLine(D2D1::Point2F(starX, starY - starR), D2D1::Point2F(starX, starY + starR), starBrush, 1.4f * scale, roundJoinStyle_.Get());
                 }
             }
         }
