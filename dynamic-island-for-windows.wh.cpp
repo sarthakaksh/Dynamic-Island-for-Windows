@@ -12031,9 +12031,12 @@ struct CompanionEyesState {
     float strokeAccumY = 0.0f;
     int currentStrokeDirX = 0;
     int currentStrokeDirY = 0;
-    int shakeReversalCount = 0;
-    double lastReversalTime = 0.0;
+    int shakeReversalCountX = 0;
+    int shakeReversalCountY = 0;
+    double lastReversalTimeX = 0.0;
+    double lastReversalTimeY = 0.0;
     double dizzyEndTime = 0.0;
+    double dizzyCooldownUntil = 0.0;
 
     // 2. Typing Peek
     double lastTypingTime = 0.0;
@@ -15732,24 +15735,27 @@ class Renderer {
         g_companionEyes.prevMousePt = mousePt;
 
         // Dizzy Shake Detection:
-        // Balanced sensitivity: Requires intentional, rapid back-and-forth wiggling
-        // (strokes >= 36px, speed >= 450px/s, 6 consecutive reversals within 0.8s).
-        // Zero false positives during regular fast mouse work or gaming.
-        if (mouseDt > 0.0005 && mouseDt < 0.15) {
+        // Heavily reduced sensitivity: Requires intentional, rapid back-and-forth wiggling along ONE axis
+        // (stroke >= 60px, speed >= 600px/s, 8 consecutive reversals within 0.55s along X or Y).
+        // Cooldown prevents immediate re-triggering. Zero false positives during fast gaming or desktop work.
+        if (mouseDt > 0.0005 && mouseDt < 0.15 && now >= g_companionEyes.dizzyCooldownUntil && now >= g_companionEyes.dizzyEndTime) {
             float curSpeed = sqrtf(mouseDeltaX * mouseDeltaX + mouseDeltaY * mouseDeltaY) / static_cast<float>(mouseDt);
 
-            if (now - g_companionEyes.lastReversalTime > 0.80) {
-                g_companionEyes.shakeReversalCount = 0;
+            if (now - g_companionEyes.lastReversalTimeX > 0.55) {
+                g_companionEyes.shakeReversalCountX = 0;
+            }
+            if (now - g_companionEyes.lastReversalTimeY > 0.55) {
+                g_companionEyes.shakeReversalCountY = 0;
             }
 
-            if (curSpeed > 450.0f) {
-                const float kMinStroke = 36.0f;
+            if (curSpeed > 600.0f) {
+                const float kMinStroke = 60.0f;
 
                 // X-axis shake detection:
                 if (mouseDeltaX > 1.0f) {
                     if (g_companionEyes.currentStrokeDirX < 0 && g_companionEyes.strokeAccumX < -kMinStroke) {
-                        g_companionEyes.shakeReversalCount++;
-                        g_companionEyes.lastReversalTime = now;
+                        g_companionEyes.shakeReversalCountX++;
+                        g_companionEyes.lastReversalTimeX = now;
                         g_companionEyes.strokeAccumX = 0.0f;
                         g_companionEyes.currentStrokeDirX = 1;
                     } else if (g_companionEyes.currentStrokeDirX <= 0) {
@@ -15759,8 +15765,8 @@ class Renderer {
                     g_companionEyes.strokeAccumX += mouseDeltaX;
                 } else if (mouseDeltaX < -1.0f) {
                     if (g_companionEyes.currentStrokeDirX > 0 && g_companionEyes.strokeAccumX > kMinStroke) {
-                        g_companionEyes.shakeReversalCount++;
-                        g_companionEyes.lastReversalTime = now;
+                        g_companionEyes.shakeReversalCountX++;
+                        g_companionEyes.lastReversalTimeX = now;
                         g_companionEyes.strokeAccumX = 0.0f;
                         g_companionEyes.currentStrokeDirX = -1;
                     } else if (g_companionEyes.currentStrokeDirX >= 0) {
@@ -15773,8 +15779,8 @@ class Renderer {
                 // Y-axis shake detection:
                 if (mouseDeltaY > 1.0f) {
                     if (g_companionEyes.currentStrokeDirY < 0 && g_companionEyes.strokeAccumY < -kMinStroke) {
-                        g_companionEyes.shakeReversalCount++;
-                        g_companionEyes.lastReversalTime = now;
+                        g_companionEyes.shakeReversalCountY++;
+                        g_companionEyes.lastReversalTimeY = now;
                         g_companionEyes.strokeAccumY = 0.0f;
                         g_companionEyes.currentStrokeDirY = 1;
                     } else if (g_companionEyes.currentStrokeDirY <= 0) {
@@ -15784,8 +15790,8 @@ class Renderer {
                     g_companionEyes.strokeAccumY += mouseDeltaY;
                 } else if (mouseDeltaY < -1.0f) {
                     if (g_companionEyes.currentStrokeDirY > 0 && g_companionEyes.strokeAccumY > kMinStroke) {
-                        g_companionEyes.shakeReversalCount++;
-                        g_companionEyes.lastReversalTime = now;
+                        g_companionEyes.shakeReversalCountY++;
+                        g_companionEyes.lastReversalTimeY = now;
                         g_companionEyes.strokeAccumY = 0.0f;
                         g_companionEyes.currentStrokeDirY = -1;
                     } else if (g_companionEyes.currentStrokeDirY >= 0) {
@@ -15795,10 +15801,12 @@ class Renderer {
                     g_companionEyes.strokeAccumY += mouseDeltaY;
                 }
 
-                // 6 rapid reversals (3 full shake cycles) triggers Dizzy!
-                if (g_companionEyes.shakeReversalCount >= 6) {
-                    g_companionEyes.dizzyEndTime = now + 2.2; // Dizzy for 2.2 seconds
-                    g_companionEyes.shakeReversalCount = 0;
+                // 8 rapid reversals along either X or Y (4 full back-and-forth shake cycles) triggers Dizzy!
+                if (g_companionEyes.shakeReversalCountX >= 8 || g_companionEyes.shakeReversalCountY >= 8) {
+                    g_companionEyes.dizzyEndTime = now + 1.8; // Dizzy for 1.8 seconds
+                    g_companionEyes.dizzyCooldownUntil = now + 3.5; // Cooldown 3.5s before next shake
+                    g_companionEyes.shakeReversalCountX = 0;
+                    g_companionEyes.shakeReversalCountY = 0;
                     g_companionEyes.strokeAccumX = 0.0f;
                     g_companionEyes.strokeAccumY = 0.0f;
                 }
@@ -15895,7 +15903,7 @@ class Renderer {
 
         // Dizzy Roll pupil swirl:
         if (isDizzy && !isDeepSleeping && !isStartled && !isAngry) {
-            const float dizzyRemain = std::clamp(static_cast<float>(g_companionEyes.dizzyEndTime - now) / 2.2f, 0.0f, 1.0f);
+            const float dizzyRemain = std::clamp(static_cast<float>(g_companionEyes.dizzyEndTime - now) / 1.8f, 0.0f, 1.0f);
             const float dizzyPhase = static_cast<float>(now * 9.5);
             pupilX = cosf(dizzyPhase) * 3.6f * scale * dizzyRemain;
             pupilY = sinf(dizzyPhase * 0.85f) * 2.4f * scale * dizzyRemain;
@@ -16756,16 +16764,17 @@ class Renderer {
             const float ad = Clamp(std::fabs(d), 0.0f, 1.0f);
             const float eased = SmoothStep01(ad);
 
-            const float alpha = std::pow(1.0f - eased, kFadePower);
+            // 1. Pure Apple-grade Cross-Dissolve:
+            // Outgoing tab fades away smoothly and cleanly before incoming tab emerges
+            const float alpha = std::pow(1.0f - eased, 2.8f);
             if (alpha <= 0.004f) {
                 return;
             }
 
-            const float scale = 1.0f - (1.0f - kMinScale) * eased;
-            const float dy = d * kTravelPx;
-
-            target_->SetTransform(D2D1::Matrix3x2F::Scale(scale, scale, center) *
-                                  D2D1::Matrix3x2F::Translation(0.0f, dy) * oldTransform);
+            // 2. Strict 1:1 Native Pixel Lock:
+            // Completely eliminated Matrix3x2F::Scale and Matrix3x2F::Translation(dy).
+            // Zero text bloating, font stretching, or blurred numbers during tab transitions.
+            target_->SetTransform(oldTransform);
             if (alpha < 0.995f && tabLayer_) {
                 target_->PushLayer(
                     D2D1::LayerParameters(rect, nullptr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
