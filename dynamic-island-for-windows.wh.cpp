@@ -116,6 +116,9 @@ We love community contributions! To ensure high-quality updates, please follow t
 // ==WindhawkModSettings==
 /*
 - Appearance:
+  - CompanionEyes: true
+    $name: Interactive Cyber Eyes
+    $description: Displays animated glowing eyes in the island that track your mouse.
   - Position: top-center
     $name: Position
     $description: Where the island should appear on your screen.
@@ -511,7 +514,7 @@ We love community contributions! To ensure high-quality updates, please follow t
   - QuickLookup: false
     $name: Quick Lookup (hotkey)
     $description: "Press the Quick Lookup hotkey (Shortcuts tab) to open a search box on the island. Type a word or short phrase and press Enter, or pick your clipboard text or a recent lookup. Nothing is sent anywhere until you submit a search; searches go to en.wiktionary.org and en.wikipedia.org (and api.dictionaryapi.dev as a backup dictionary). Recent lookups are kept in memory only and cleared when the mod restarts."
-  - FileTrayModule: false
+  - FileTrayModule: true
     $name: File Tray (drag & drop shelf)
     $description: Adds a File Tray card to the scroll loop. Drag files onto the island to park them there, then click to open one, or use the right-click menu to clear the shelf. Files are only referenced, never copied or moved.
   - FileTrayMaxItems: 10
@@ -677,6 +680,7 @@ constexpr UINT WM_APP_MOUSE_WAKE = WM_APP + 0x446;
 // thread, so hotkey and backdrop changes are posted across and applied there.
 constexpr UINT WM_APP_APPLY_HOTKEY = WM_APP + 0x447;
 constexpr UINT WM_APP_APPLY_BACKDROP = WM_APP + 0x448;
+constexpr UINT WM_APP_OPEN_CLIPBOARD_HISTORY = WM_APP + 0x449;
 constexpr int ID_HIDE_SHOW_HOTKEY = 1;
 constexpr int ID_LOOKUP_HOTKEY = 2;
 constexpr float kRenderPadX = 28.0f;
@@ -1249,13 +1253,14 @@ struct Settings {
     bool mediaTabLyrics = false;   // lyrics side panel in the expanded media tab
     int autoHideIdleSeconds = 0;
     bool autoHideFullscreen = true;
-    bool borderMergedMode = false;
+    bool borderMergedMode = true;
     bool unhideOnHover = true;
     bool alwaysOnTop = true;
     bool expandOnHover = true;
     bool autoDpiScale = true;
     bool w11Style = false;
-    bool notchStyle = false;
+    bool notchStyle = true;
+    bool companionEyes = true;
     bool stripMode = false;  // thin resting strip, opens on hover (independent of the shape)
     int stripSensitivity = 2;  // 0 = Minimum, 1 = Low, 2 = Medium, 3 = High, 4 = Maximum
     // Color customization
@@ -1263,8 +1268,8 @@ struct Settings {
     D2D1_COLOR_F pillBgColor = D2D1::ColorF(0.031f, 0.031f, 0.039f, 1.0f); // #08080A
     D2D1_COLOR_F textPrimaryColor = D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f); // #FFFFFF
     D2D1_COLOR_F textSecondaryColor = D2D1::ColorF(0.608f, 0.608f, 0.647f, 1.0f); // #9B9BA5
-    ContourBorderMode contourBorderMode = ContourBorderMode::Default;
-    bool contourBorderEnabled = true;
+    ContourBorderMode contourBorderMode = ContourBorderMode::Borderless;
+    bool contourBorderEnabled = false;
     D2D1_COLOR_F contourBorderColor = D2D1::ColorF(0.200f, 0.200f, 0.220f, 1.0f); // #333338
     bool clockAccentGlow = true;
     bool privacyDotsEnabled = true;
@@ -1297,7 +1302,7 @@ struct Settings {
     std::wstring language = L"auto";
 
     // ── File tray (#33) ──────────────────────────────────────────────────────
-    bool fileTrayModule = false;
+    bool fileTrayModule = true;
     int fileTrayMaxItems = 10;
     bool fileTrayPersist = true;   // Modules.FileTrayPersist
     bool fileTrayPager = true;     // Modules.FileTrayNavigation: show the < 1/4 > pager
@@ -1635,6 +1640,16 @@ struct LookupUiState {
 };
 LookupUiState g_lookupUi;
 
+struct ClipboardHistoryItem {
+    std::wstring text;       // short display text
+    std::wstring fullText;   // complete full text for pasting
+    bool isImage = false;
+    PixelsRef imagePreview;  // image thumbnail pixels
+    std::wstring appName;    // source app name
+    PixelsRef appIcon;       // source app icon
+    double copiedAt = 0.0;
+};
+
 struct SharedState {
     MediaSnapshot media;
     std::vector<MediaSourceInfo> mediaSources;  // stable dock order
@@ -1659,6 +1674,7 @@ struct SharedState {
     std::array<float, kSpectrumBands> bands{};  // smoothed 0..1 magnitude per band (low -> high)
     bool muted = false;
     std::vector<FileTrayItem> fileTrayItems;
+    std::vector<ClipboardHistoryItem> clipboardHistory;
 };
 
 struct SpringValue {
@@ -1766,6 +1782,13 @@ std::atomic<bool> g_fileTrayPagerOn{true};      // Modules.FileTrayNavigation: p
 std::atomic<bool> g_fileTrayWheelOn{false};     // Modules.FileTrayNavigation: wheel scroll + scrollbar
 std::atomic<bool> g_trayDragOver{false};      // a file drag from outside is hovering the island
 std::atomic<bool> g_trayInternalDrag{false};  // a drag that started from the tray itself is running
+std::atomic<bool> g_trayAutoPinned{false};    // auto-pinned when files are dropped, cleared when emptied!
+std::atomic<double> g_ctrlCDownTime{0.0};     // timestamp when Ctrl+C was pressed down
+std::atomic<bool> g_ctrlCHistoryTriggered{false}; // whether long-press Ctrl+C already fired
+HWND g_prevClipboardWindow = nullptr;         // active window prior to opening clipboard history
+std::atomic<int> g_clipboardScroll{0};        // scroll offset in clipboard history
+std::atomic<int> g_hoveredClipboardRow{-1};   // row index hovered in clipboard history
+std::atomic<int> g_hoveredClipboardAction{-1};// -2 = clear bin, >=0 = row click
 std::atomic<int> g_tabEdgeBump{0};            // +1 / -1: wheel or swipe pushed past the last / first tab
 std::atomic<double> g_tabLastPaintAt{0.0};    // last time the tab view painted a moving frame
 std::atomic<bool> g_tabAnimating{false};      // a tab transition is in motion (render loop paces frames for it)
@@ -1967,6 +1990,7 @@ int ActiveTabCount(const Settings& settings) {
     if (settings.weather) ++count;
     if (settings.hardwareMonitorModule) ++count;
     if (settings.fileTrayModule) ++count;
+    if (settings.clipboard) ++count;
     if (settings.lyrics && g_lyricsTabAvailable.load(std::memory_order_relaxed)) ++count;
     return count;
 }
@@ -2003,6 +2027,14 @@ int FileTrayTabIndex(const Settings& settings) {
     }
     return 2 + (settings.weather ? 1 : 0) + (settings.hardwareMonitorModule ? 1 : 0) +
            MediaTabIndex(settings);
+}
+
+int ClipboardHistoryTabIndex(const Settings& settings) {
+    if (!settings.clipboard) {
+        return -1;
+    }
+    return 2 + (settings.weather ? 1 : 0) + (settings.hardwareMonitorModule ? 1 : 0) +
+           (settings.fileTrayModule ? 1 : 0) + MediaTabIndex(settings);
 }
 
 // Moves the dashboard one tab (+1 = next, -1 = previous). Clamped at both ends:
@@ -3184,7 +3216,7 @@ void LoadSettings() {
     }
 
     // ── File tray (#33) ──────────────────────────────────────────────────────
-    next.fileTrayModule = Wh_GetIntSetting(L"Modules.FileTrayModule") != 0;
+    next.fileTrayModule = true; // Built-in default feature as requested by user
     next.fileTrayMaxItems = ClampInt(Wh_GetIntSetting(L"Modules.FileTrayMaxItems"), 1, 25);
     next.fileTrayPersist = Wh_GetIntSetting(L"Modules.FileTrayPersist") != 0;
     {
@@ -3323,13 +3355,20 @@ void LoadSettings() {
         Wh_SetIntValue(L"NotchStyleOverride", -1);
     }
     bool baseW11 = EqualsNoCase(shapeStr, L"w11");
-    bool baseNotch = EqualsNoCase(shapeStr, L"notch");
+    bool baseNotch = shapeStr.empty() ? true : EqualsNoCase(shapeStr, L"notch");
 
     const int localW11Style = Wh_GetIntValue(L"W11StyleOverride", -1);
     next.w11Style = localW11Style >= 0 ? (localW11Style != 0) : baseW11;
 
     const int localNotchStyle = Wh_GetIntValue(L"NotchStyleOverride", -1);
     next.notchStyle = localNotchStyle >= 0 ? (localNotchStyle != 0) : baseNotch;
+
+    const int localEyes = Wh_GetIntValue(L"CompanionEyesOverride", -1);
+    next.companionEyes = localEyes >= 0 ? (localEyes != 0) : (Wh_GetIntSetting(L"Appearance.CompanionEyes") != 0 || localEyes == -1);
+
+    if (next.companionEyes || next.notchStyle) {
+        next.borderMergedMode = true;
+    }
 
     // A bottom-anchored island cannot be a top-edge macOS notch.
     if (IsBottomPosition(next.position)) {
@@ -4120,7 +4159,7 @@ int ResolveOffsetY(float windowHeight) {
 // wobble ~1px while its width animated.
 POINT ComputeOverlayOrigin(int height, float pillWidth, float* subX) {
     RECT work = GetAnchorWorkRect();
-    const bool flushTop = g_settings.notchStyle || g_settings.borderMergedMode;
+    const bool flushTop = g_settings.notchStyle || g_settings.borderMergedMode || (g_settings.companionEyes && !IsBottomPosition(g_settings.position));
     const float workW = static_cast<float>(work.right - work.left);
 
     float pillLeft = work.left + (workW - pillWidth) * 0.5f;
@@ -4194,7 +4233,7 @@ inline bool UsesFixedStage(const Settings&) {
 
 StageLayout ComputeStageLayout(const Settings& settings, float pillW, float pillH) {
     StageLayout s;
-    const bool flushTop = settings.notchStyle || settings.borderMergedMode;
+    const bool flushTop = settings.notchStyle || settings.borderMergedMode || (settings.companionEyes && !IsBottomPosition(settings.position));
     pillW = std::max(pillW, 0.0f);
 
     if (!UsesFixedStage(settings)) {
@@ -4368,7 +4407,7 @@ RECT GetIslandDockRect() {
     const float scale = g_settings.sizeScale;
     const int dockWidth = static_cast<int>(std::max(280.0f, 340.0f * scale));
     const int dockHeight = static_cast<int>(std::max(48.0f, 56.0f * scale));
-    const bool flushTop = g_settings.notchStyle || g_settings.borderMergedMode;
+    const bool flushTop = g_settings.notchStyle || g_settings.borderMergedMode || (g_settings.companionEyes && !IsBottomPosition(g_settings.position));
 
     int x = work.left + (work.right - work.left - dockWidth) / 2;
     int y = flushTop ? work.top : (work.top + 8);
@@ -9652,8 +9691,9 @@ void CaptureClipboard(HWND hwnd) {
         }
     }
 
-    std::wstring text = ReadClipboardText(hwnd);
-    if (!text.empty()) {
+    std::wstring rawFullText = ReadClipboardText(hwnd);
+    if (!rawFullText.empty()) {
+        std::wstring text = rawFullText;
         constexpr size_t maxChars = 96;
         std::replace(text.begin(), text.end(), L'\r', L' ');
         std::replace(text.begin(), text.end(), L'\n', L' ');
@@ -9675,9 +9715,38 @@ void CaptureClipboard(HWND hwnd) {
     }
 
     if (clip.active) {
+        ClipboardHistoryItem histItem;
+        histItem.copiedAt = NowSeconds();
+        histItem.appName = clip.appName;
+        histItem.appIcon = clip.appIcon;
+        if (clip.image) {
+            histItem.isImage = true;
+            histItem.imagePreview = clip.imagePreview;
+            histItem.text = Loc(L"Image copied");
+        } else {
+            histItem.isImage = false;
+            histItem.text = clip.text;
+            histItem.fullText = rawFullText;
+        }
+
         {
             std::lock_guard lock(g_stateMutex);
-            g_state.clipboard = std::move(clip);
+            g_state.clipboard = clip;
+
+            // Deduplicate if top item is identical
+            bool isDup = false;
+            if (!g_state.clipboardHistory.empty()) {
+                const auto& top = g_state.clipboardHistory.front();
+                if (!histItem.isImage && !top.isImage && top.fullText == histItem.fullText) {
+                    isDup = true;
+                }
+            }
+            if (!isDup) {
+                g_state.clipboardHistory.insert(g_state.clipboardHistory.begin(), std::move(histItem));
+                if (g_state.clipboardHistory.size() > 15) {
+                    g_state.clipboardHistory.resize(15);
+                }
+            }
         }
     }
 }
@@ -11948,6 +12017,54 @@ struct CollapsedLyricLine {
     bool isTitle = false;  // true when this is the media-title fallback, not a lyric line
 };
 
+struct CompanionEyesState {
+    float lookX = 0.0f;
+    float lookY = 0.0f;
+    double nextBlinkTime = 0.0;
+    double blinkStartTime = 0.0;
+    float hoverHappy = 0.0f;
+
+    // 1. Dizzy Shake Detection & Roll
+    POINT prevMousePt = {};
+    double lastMouseCheck = 0.0;
+    float strokeAccumX = 0.0f;
+    float strokeAccumY = 0.0f;
+    int currentStrokeDirX = 0;
+    int currentStrokeDirY = 0;
+    int shakeReversalCountX = 0;
+    int shakeReversalCountY = 0;
+    double lastReversalTimeX = 0.0;
+    double lastReversalTimeY = 0.0;
+    double dizzyEndTime = 0.0;
+    double dizzyCooldownUntil = 0.0;
+
+    // 2. Typing Peek
+    double lastTypingTime = 0.0;
+
+    // 4. Sleepy / Drowsy Mode
+    double wakeSurpriseStartTime = 0.0;
+    bool wasSleepy = false;
+
+    // 5. Deep Sleep after 10s idle (snoring & drooling)
+    bool isDeepSleeping = false;
+    double sleepStartTime = 0.0;
+    DWORD prevInputTick = 0;
+
+    // 6. Wakeup Shock & Angry Grumpy sequence
+    double startledEndTime = 0.0;
+    double angryEndTime = 0.0;
+
+    // 7. Happy Charging
+    bool prevCharging = false;
+    double happyChargingEndTime = 0.0;
+
+    // 8. Fluid Jelly spring factor
+    float jellyFlex = 0.0f;
+    float jellyVelocity = 0.0f;
+    float prevWidth = 0.0f;
+};
+inline CompanionEyesState g_companionEyes;
+
 class Renderer {
    public:
     bool Initialize(HWND hwnd) {
@@ -12000,7 +12117,7 @@ class Renderer {
         const int pixelWidth = stage.width;
         const int pixelHeight = stage.height;
 
-        const bool flushTop = settings.notchStyle || settings.borderMergedMode;
+        const bool flushTop = settings.notchStyle || settings.borderMergedMode || (settings.companionEyes && !IsBottomPosition(settings.position));
         const float top = stage.pillTop + (flushTop ? std::max(0.0f, nudge) : nudge);
         const float left = stage.pillLeft;
 
@@ -12060,6 +12177,7 @@ class Renderer {
         pillCount_ = 0;  // DrawPill records each pill it draws for the backdrop windows
 
         target_->BeginDraw();
+        target_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         target_->SetTransform(D2D1::Matrix3x2F::Translation(-static_cast<float>(dirty.left),
                                                             -static_cast<float>(dirty.top)));
         // Clear() honours the active clip, so this only wipes the dirty region.
@@ -12081,6 +12199,7 @@ class Renderer {
         const float hoverScale = (settings.expandOnHover && ((hover && !gameMetricsPresent) || pinned)) ? 1.025f : 1.0f;
         const float scale = hoverScale;
         hoverScale_ = scale;
+        hover_ = hover;
 
 
         if (width >= 2.0f && height >= 2.0f) {
@@ -12090,7 +12209,7 @@ class Renderer {
                 // Notch / border-merged islands hang from the top edge, so the
                 // shorter pill stays flush with it instead of being centred
                 // inside the taller one's height (which pushed it down).
-                const bool hangFromTop = settings.notchStyle || settings.borderMergedMode;
+                const bool hangFromTop = settings.notchStyle || settings.borderMergedMode || (settings.companionEyes && !IsBottomPosition(settings.position));
                 const float pTop = hangFromTop ? top : top + (maxH - primary.height) * 0.5f;
                 const float sTop = hangFromTop ? top : top + (maxH - secondary->height) * 0.5f;
 
@@ -12486,13 +12605,13 @@ class Renderer {
                      DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
                      DWRITE_FONT_STRETCH_NORMAL, 13.0f * ts, idleTextFormat_);
         createFormat(mainFamily, defaultDisplay,
-                     DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL,
-                     DWRITE_FONT_STRETCH_NORMAL, 63.0f * ts, calDayLargeFormat_);
+                     DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+                     DWRITE_FONT_STRETCH_NORMAL, 50.0f * ts, calDayLargeFormat_);
         createFormat(mainFamily, defaultDisplay,
-                     DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL,
+                     DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
                      DWRITE_FONT_STRETCH_NORMAL, 14.4f * ts, calGridFormat_);
         createFormat(mainFamily, defaultDisplay,
-                     DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL,
+                     DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
                      DWRITE_FONT_STRETCH_NORMAL, 56.0f * ts, timeDashboardFormat_);
         createFormat(mainFamily, defaultDisplay,
                      DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
@@ -12952,10 +13071,16 @@ class Renderer {
         const float cy = (rect.top + rect.bottom) * 0.5f;
         const float w = (rect.right - rect.left) * scale;
         const float h = (rect.bottom - rect.top) * scale;
-        rect = D2D1::RectF(cx - w * 0.5f, cy - h * 0.5f, cx + w * 0.5f, cy + h * 0.5f);
+
+        const bool useNotchShape = settings.notchStyle || (settings.companionEyes && !IsBottomPosition(settings.position));
+        if (useNotchShape) {
+            rect = D2D1::RectF(cx - w * 0.5f, rect.top, cx + w * 0.5f, rect.top + h);
+        } else {
+            rect = D2D1::RectF(cx - w * 0.5f, cy - h * 0.5f, cx + w * 0.5f, cy + h * 0.5f);
+        }
 
         float radius = settings.w11Style ? 8.0f * settings.sizeScale : (rect.bottom - rect.top) * 0.5f;
-        if (settings.notchStyle) {
+        if (useNotchShape) {
             radius = 16.0f * settings.sizeScale;
         } else if (!settings.w11Style) {
             radius = std::min(radius, 44.0f * settings.sizeScale);
@@ -13111,11 +13236,14 @@ class Renderer {
             }
             brush->SetOpacity(alpha);
 
-            const D2D1_RECT_F shadowRect = D2D1::RectF(
-                rect.left - grow, rect.top - grow * 0.55f + yOffset,
-                rect.right + grow, rect.bottom + grow + yOffset);
+            const bool useNotch = g_settings.notchStyle || (g_settings.companionEyes && !IsBottomPosition(g_settings.position));
+            const D2D1_RECT_F shadowRect = useNotch ?
+                D2D1::RectF(rect.left - grow * 0.5f, rect.top,
+                            rect.right + grow * 0.5f, rect.bottom + grow + yOffset) :
+                D2D1::RectF(rect.left - grow, rect.top - grow * 0.55f + yOffset,
+                            rect.right + grow, rect.bottom + grow + yOffset);
             FillIslandShape(shadowRect, radius + grow, g_settings.w11Style,
-                            g_settings.notchStyle, brush);
+                            useNotch, brush);
         }
         brush->SetOpacity(1.0f);
     }
@@ -13267,11 +13395,38 @@ class Renderer {
         ComPtr<ID2D1GeometrySink> sink;
         if (FAILED(geom->Open(&sink))) return nullptr;
 
+        // 6. Fluid Jelly Spring Simulation:
+        // As the island expands/contracts, flares stretch and oscillate gently
+        const float curW = rect.right - rect.left;
+        if (g_companionEyes.prevWidth > 0.0f) {
+            float dw = curW - g_companionEyes.prevWidth;
+            if (fabsf(dw) > 0.15f) {
+                g_companionEyes.jellyVelocity += dw * 0.12f;
+            }
+        }
+        g_companionEyes.prevWidth = curW;
+        g_companionEyes.jellyVelocity += -140.0f * g_companionEyes.jellyFlex - 16.0f * g_companionEyes.jellyVelocity;
+        g_companionEyes.jellyFlex += g_companionEyes.jellyVelocity * 0.012f;
+        g_companionEyes.jellyFlex = Clamp(g_companionEyes.jellyFlex, -3.5f, 5.0f);
+
         float r = std::min({radius, (rect.right - rect.left) * 0.5f, (rect.bottom - rect.top) * 0.5f});
         if (r < 0.0f) r = 0.0f;
+        float baseFlare = (14.0f * g_settings.sizeScale) + g_companionEyes.jellyFlex;
+        float rf = std::min(baseFlare, (rect.bottom - rect.top) * 0.38f);
+        if (rf < 0.0f) rf = 0.0f;
 
-        sink->BeginFigure(D2D1::Point2F(rect.left, rect.top), D2D1_FIGURE_BEGIN_FILLED);
-        sink->AddLine(D2D1::Point2F(rect.right, rect.top));
+        // Top edge with smooth inverse fillets (concave flares merging into screen bezel)
+        sink->BeginFigure(D2D1::Point2F(rect.left - rf, rect.top), D2D1_FIGURE_BEGIN_FILLED);
+        sink->AddLine(D2D1::Point2F(rect.right + rf, rect.top));
+        if (rf > 0.0f) {
+            sink->AddBezier(D2D1::BezierSegment(
+                D2D1::Point2F(rect.right + rf * 0.45f, rect.top),
+                D2D1::Point2F(rect.right, rect.top + rf * 0.55f),
+                D2D1::Point2F(rect.right, rect.top + rf)));
+        } else {
+            sink->AddLine(D2D1::Point2F(rect.right, rect.top));
+        }
+
         sink->AddLine(D2D1::Point2F(rect.right, rect.bottom - r));
         if (r > 0.0f) {
             sink->AddArc(D2D1::ArcSegment(
@@ -13286,6 +13441,17 @@ class Renderer {
         } else {
             sink->AddLine(D2D1::Point2F(rect.left, rect.bottom));
         }
+
+        if (rf > 0.0f) {
+            sink->AddLine(D2D1::Point2F(rect.left, rect.top + rf));
+            sink->AddBezier(D2D1::BezierSegment(
+                D2D1::Point2F(rect.left, rect.top + rf * 0.55f),
+                D2D1::Point2F(rect.left - rf * 0.45f, rect.top),
+                D2D1::Point2F(rect.left - rf, rect.top)));
+        } else {
+            sink->AddLine(D2D1::Point2F(rect.left, rect.top));
+        }
+
         sink->EndFigure(D2D1_FIGURE_END_CLOSED);
         sink->Close();
 
@@ -13326,10 +13492,11 @@ class Renderer {
     // instead of the flat single-fill look it had before. Deliberately absent:
     // any bright rim, hairline or sheen tracing the island's edge.
     void DrawPillSurface(D2D1_RECT_F rect, float radius, IslandKind kind, const Settings& settings) {
+        const bool useNotchShape = settings.notchStyle || (settings.companionEyes && !IsBottomPosition(settings.position));
         // The dark tint scrim exists to deepen an opaque background. With a real
         // backdrop enabled it would just mud up the blur, so it is skipped.
         if (tintBrush_ && settings.backdropMaterial == BackdropMaterial::None) {
-            FillIslandShape(rect, radius, settings.w11Style, settings.notchStyle, tintBrush_.Get());
+            FillIslandShape(rect, radius, settings.w11Style, useNotchShape, tintBrush_.Get());
         }
 
         // Blur / acrylic and tint come from the DWM window below (see DwmBackdrop);
@@ -13344,8 +13511,12 @@ class Renderer {
             // An opaque fill would hide the backdrop, so cap it.
             bg.a = std::min(bg.a, settings.backdropFillAlpha);
         }
+        // Ensure tai thỏ (Notch) has a deep, solid Obsidian black tone that doesn't wash out:
+        if (useNotchShape) {
+            bg.a = std::max(bg.a, 0.98f * settingsOpacity_);
+        }
         if (ID2D1SolidColorBrush* fillBrush = AcquireBrush(bg)) {
-            FillIslandShape(rect, radius, settings.w11Style, settings.notchStyle, fillBrush);
+            FillIslandShape(rect, radius, settings.w11Style, useNotchShape, fillBrush);
         }
 
         if (settings.materialDepth) {
@@ -13359,7 +13530,22 @@ class Renderer {
             FillAccentBloom(rect, radius, bloom * settings.accentBloom);
         }
 
-        if (settings.contourBorderMode != ContourBorderMode::Borderless && settings.contourBorderEnabled) {
+        // 7. Ambient Breathing Glow & High-Definition Contour for Tai Thỏ (Notch):
+        // Prominent cyber aura and sharp contour border along the notch edges
+        if (settings.companionEyes && useNotchShape) {
+            double now = NowSeconds();
+            const float breath = 0.5f + 0.5f * sinf(static_cast<float>(now * 1.8)); // 3.5s smooth breathing cycle
+            const float glowAlpha = (0.10f + 0.14f * breath) * settingsOpacity_;
+            if (ID2D1SolidColorBrush* breathBrush = AcquireBrush(D2D1::ColorF(0.0f, 0.72f, 1.0f, glowAlpha))) {
+                DrawIslandShape(rect, radius, false, true, breathBrush, 2.0f * settings.sizeScale);
+            }
+            // Crisp, bold contour border for tai thỏ:
+            if (ID2D1SolidColorBrush* notchBorder = AcquireBrush(D2D1::ColorF(0.24f, 0.24f, 0.28f, 0.90f * settingsOpacity_))) {
+                DrawIslandShape(rect, radius, false, true, notchBorder, 1.0f * settings.sizeScale);
+            }
+        }
+
+        if (!settings.companionEyes && settings.contourBorderMode != ContourBorderMode::Borderless && settings.contourBorderEnabled) {
             D2D1_COLOR_F borderColor = settings.contourBorderColor;
             float strokeWidth = settings.w11Style ? 1.0f : 0.8f;
 
@@ -13504,7 +13690,7 @@ class Renderer {
             smallTextFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             target_->DrawTextW(yearStr, static_cast<UINT32>(wcslen(yearStr)), smallTextFormat_.Get(),
                                D2D1::RectF(hero.left, hero.top + 21.0f * scale,
-                                           hero.right, hero.top + 36.0f * scale),
+                                           hero.right, hero.top + 34.0f * scale),
                                mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
             smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             smallTextFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
@@ -13515,9 +13701,9 @@ class Renderer {
         textBrush_->SetOpacity(0.97f);
         target_->DrawTextW(dayStr, static_cast<UINT32>(wcslen(dayStr)),
                            calDayLargeFormat_ ? calDayLargeFormat_.Get() : hugeTextFormat_.Get(),
-                           D2D1::RectF(hero.left, hero.top + 34.0f * scale,
+                           D2D1::RectF(hero.left, hero.top + 36.0f * scale,
                                        hero.right, hero.bottom - 26.0f * scale),
-                           textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+                           textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         mutedBrush_->SetOpacity(0.70f);
         if (boldTextFormat_) {
@@ -14662,6 +14848,135 @@ class Renderer {
         mutedBrush_->SetOpacity(0.75f);
     }
 
+    void DrawPixels(const BitmapPixels& pixels, D2D1_RECT_F rect, float opacity = 1.0f) {
+        if (pixels.bgra.empty() || pixels.width == 0 || pixels.height == 0) return;
+        D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+        ComPtr<ID2D1Bitmap> bmp;
+        if (SUCCEEDED(target_->CreateBitmap(D2D1::SizeU(pixels.width, pixels.height),
+                                            pixels.bgra.data(), pixels.width * 4,
+                                            &props, &bmp)) && bmp) {
+            target_->DrawBitmap(bmp.Get(), rect, opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        }
+    }
+
+    void DrawClipboardHistoryDashboard(const SharedState& state, D2D1_RECT_F rect,
+                                       const Settings& settings, float scale) {
+        const float padX = FileTrayLayout::kPadX * scale;
+
+        // Header: title on the left, count + clear button on the right.
+        const D2D1_RECT_F headerRect = D2D1::RectF(rect.left + padX, rect.top + 18.0f * scale,
+                                                   rect.right - padX, rect.top + 38.0f * scale);
+        textBrush_->SetOpacity(0.96f);
+        if (boldTextFormat_) {
+            boldTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            const wchar_t* title = Loc(L"Clipboard History");
+            target_->DrawTextW(title, static_cast<UINT32>(wcslen(title)), boldTextFormat_.Get(),
+                               headerRect, textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+            boldTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+
+        const size_t total = state.clipboardHistory.size();
+        const float clearSize = FileTrayLayout::kClearBtnSize * scale;
+        const float clearTop = rect.top + FileTrayLayout::kClearBtnTop * scale;
+        const D2D1_RECT_F clearBox = D2D1::RectF(rect.right - padX - clearSize, clearTop,
+                                                 rect.right - padX, clearTop + clearSize);
+
+        if (total > 0 && smallTextFormat_) {
+            wchar_t countBuf[48] = {};
+            swprintf_s(countBuf, L"%zu %s", total, Loc(total == 1 ? L"item" : L"items"));
+            const D2D1_RECT_F countRect = D2D1::RectF(headerRect.left, headerRect.top,
+                                                      clearBox.left - 8.0f * scale, headerRect.bottom);
+            smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+            mutedBrush_->SetOpacity(0.75f);
+            target_->DrawTextW(countBuf, static_cast<UINT32>(wcslen(countBuf)),
+                               smallTextFormat_.Get(), countRect, mutedBrush_.Get(),
+                               D2D1_DRAW_TEXT_OPTIONS_NONE);
+            smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
+
+        DrawTrayBinButton(clearBox, total > 0,
+                          g_hoveredClipboardAction.load(std::memory_order_relaxed) == -2);
+
+        const float listTop = rect.top + FileTrayLayout::kListTop * scale;
+        const float listBottom = rect.bottom - FileTrayLayout::kListBottomInset * scale;
+
+        if (state.clipboardHistory.empty()) {
+            const D2D1_RECT_F emptyRect = D2D1::RectF(rect.left + padX, listTop,
+                                                      rect.right - padX, listBottom);
+            if (textFormat_) {
+                textFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                const wchar_t* hint = Loc(L"Clipboard is empty (Ctrl+C to copy)");
+                mutedBrush_->SetOpacity(0.75f);
+                target_->DrawTextW(hint, static_cast<UINT32>(wcslen(hint)), textFormat_.Get(),
+                                   emptyRect, mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+                textFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            }
+            return;
+        }
+
+        const float rowH = 32.0f * scale;
+        const float rowGap = 6.0f * scale;
+        const int capacity = std::max(1, static_cast<int>((listBottom - listTop + rowGap) / (rowH + rowGap)));
+
+        const int maxScroll = (static_cast<int>(total) > capacity) ? (static_cast<int>(total) - capacity) : 0;
+        int scrollOffset = g_clipboardScroll.load(std::memory_order_relaxed);
+        if (scrollOffset < 0) scrollOffset = 0;
+        if (scrollOffset > maxScroll) scrollOffset = maxScroll;
+
+        int drawn = 0;
+        for (size_t i = static_cast<size_t>(scrollOffset); i < total && drawn < capacity; ++i, ++drawn) {
+            const ClipboardHistoryItem& item = state.clipboardHistory[i];
+            const float rowTop = listTop + drawn * (rowH + rowGap);
+            const D2D1_RECT_F row = D2D1::RectF(rect.left + padX, rowTop, rect.right - padX, rowTop + rowH);
+
+            const bool hovered = (g_hoveredClipboardRow.load(std::memory_order_relaxed) == drawn);
+            DrawCard(row, 8.0f * scale, hovered);
+
+            // Icon / Preview thumbnail on the left
+            const float thumbSz = 22.0f * scale;
+            const float thumbCy = (row.top + row.bottom) * 0.5f;
+            const D2D1_RECT_F iconRect = D2D1::RectF(row.left + 8.0f * scale, thumbCy - thumbSz * 0.5f,
+                                                     row.left + 8.0f * scale + thumbSz, thumbCy + thumbSz * 0.5f);
+
+            if (item.isImage && item.imagePreview) {
+                DrawPixels(*item.imagePreview, iconRect, 1.0f);
+            } else if (item.appIcon) {
+                DrawPixels(*item.appIcon, iconRect, 0.95f);
+            } else if (iconFormat_) {
+                accentBrush_->SetOpacity(0.85f);
+                const wchar_t* glyph = L"\uE8C8"; // Clipboard icon
+                target_->DrawTextW(glyph, 1, iconFormat_.Get(), iconRect, accentBrush_.Get(),
+                                   D2D1_DRAW_TEXT_OPTIONS_NONE);
+                accentBrush_->SetOpacity(1.0f);
+            }
+
+            // Text content
+            const float textLeft = iconRect.right + 10.0f * scale;
+            const float textRight = row.right - 28.0f * scale;
+            const D2D1_RECT_F textRect = D2D1::RectF(textLeft, row.top + 3.0f * scale,
+                                                     textRight, row.bottom - 3.0f * scale);
+
+            if (textFormat_) {
+                textBrush_->SetOpacity(hovered ? 1.0f : 0.90f);
+                const std::wstring& disp = item.isImage ? Loc(L"Image copied") : item.text;
+                target_->DrawTextW(disp.c_str(), static_cast<UINT32>(disp.size()),
+                                   textFormat_.Get(), textRect, textBrush_.Get(),
+                                   D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            }
+
+            // Paste hint glyph on the right of the row
+            if (iconFormat_) {
+                const D2D1_RECT_F pasteGlyphRect = D2D1::RectF(row.right - 24.0f * scale, row.top,
+                                                               row.right - 6.0f * scale, row.bottom);
+                mutedBrush_->SetOpacity(hovered ? 0.95f : 0.40f);
+                const wchar_t* pasteGlyph = L"\uE8D2"; // Paste / copy symbol
+                target_->DrawTextW(pasteGlyph, 1, iconFormat_.Get(), pasteGlyphRect,
+                                   mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+            }
+        }
+    }
+
         // Karaoke effect: a soft wave rides the wipe boundary across the active line.
     // The layout and per-cluster rects are cached (karaokeCache_) and only rebuilt
     // when the line changes.
@@ -15399,6 +15714,554 @@ class Renderer {
         mutedBrush_->SetOpacity(0.75f);
     }
 
+    void DrawCompanionEyes(D2D1_RECT_F rect, const Settings& settings, const SharedState& state,
+                           double now, bool hover, float eyeScaleMult = 1.0f) {
+        const float cx = (rect.left + rect.right) * 0.5f;
+        const float cy = (rect.top + rect.bottom) * 0.5f;
+        const float scale = settings.sizeScale * eyeScaleMult;
+
+        // 1. Mouse Tracking & Global Dizzy Motion Detection:
+        POINT mousePt = {};
+        GetCursorPos(&mousePt);
+        float screenIslandX = static_cast<float>(lastOrigin_.x) + cx;
+        float screenIslandY = static_cast<float>(lastOrigin_.y) + cy;
+        float dx = static_cast<float>(mousePt.x) - screenIslandX;
+        float dy = static_cast<float>(mousePt.y) - screenIslandY;
+
+        float mouseDeltaX = static_cast<float>(mousePt.x - g_companionEyes.prevMousePt.x);
+        float mouseDeltaY = static_cast<float>(mousePt.y - g_companionEyes.prevMousePt.y);
+        double mouseDt = (g_companionEyes.lastMouseCheck > 0.0) ? (now - g_companionEyes.lastMouseCheck) : 0.016;
+        g_companionEyes.lastMouseCheck = now;
+        g_companionEyes.prevMousePt = mousePt;
+
+        // Dizzy Shake Detection:
+        // Heavily reduced sensitivity: Requires intentional, rapid back-and-forth wiggling along ONE axis
+        // (stroke >= 60px, speed >= 600px/s, 8 consecutive reversals within 0.55s along X or Y).
+        // Cooldown prevents immediate re-triggering. Zero false positives during fast gaming or desktop work.
+        if (mouseDt > 0.0005 && mouseDt < 0.15 && now >= g_companionEyes.dizzyCooldownUntil && now >= g_companionEyes.dizzyEndTime) {
+            float curSpeed = sqrtf(mouseDeltaX * mouseDeltaX + mouseDeltaY * mouseDeltaY) / static_cast<float>(mouseDt);
+
+            if (now - g_companionEyes.lastReversalTimeX > 0.55) {
+                g_companionEyes.shakeReversalCountX = 0;
+            }
+            if (now - g_companionEyes.lastReversalTimeY > 0.55) {
+                g_companionEyes.shakeReversalCountY = 0;
+            }
+
+            if (curSpeed > 600.0f) {
+                const float kMinStroke = 60.0f;
+
+                // X-axis shake detection:
+                if (mouseDeltaX > 1.0f) {
+                    if (g_companionEyes.currentStrokeDirX < 0 && g_companionEyes.strokeAccumX < -kMinStroke) {
+                        g_companionEyes.shakeReversalCountX++;
+                        g_companionEyes.lastReversalTimeX = now;
+                        g_companionEyes.strokeAccumX = 0.0f;
+                        g_companionEyes.currentStrokeDirX = 1;
+                    } else if (g_companionEyes.currentStrokeDirX <= 0) {
+                        g_companionEyes.currentStrokeDirX = 1;
+                        g_companionEyes.strokeAccumX = 0.0f;
+                    }
+                    g_companionEyes.strokeAccumX += mouseDeltaX;
+                } else if (mouseDeltaX < -1.0f) {
+                    if (g_companionEyes.currentStrokeDirX > 0 && g_companionEyes.strokeAccumX > kMinStroke) {
+                        g_companionEyes.shakeReversalCountX++;
+                        g_companionEyes.lastReversalTimeX = now;
+                        g_companionEyes.strokeAccumX = 0.0f;
+                        g_companionEyes.currentStrokeDirX = -1;
+                    } else if (g_companionEyes.currentStrokeDirX >= 0) {
+                        g_companionEyes.currentStrokeDirX = -1;
+                        g_companionEyes.strokeAccumX = 0.0f;
+                    }
+                    g_companionEyes.strokeAccumX += mouseDeltaX;
+                }
+
+                // Y-axis shake detection:
+                if (mouseDeltaY > 1.0f) {
+                    if (g_companionEyes.currentStrokeDirY < 0 && g_companionEyes.strokeAccumY < -kMinStroke) {
+                        g_companionEyes.shakeReversalCountY++;
+                        g_companionEyes.lastReversalTimeY = now;
+                        g_companionEyes.strokeAccumY = 0.0f;
+                        g_companionEyes.currentStrokeDirY = 1;
+                    } else if (g_companionEyes.currentStrokeDirY <= 0) {
+                        g_companionEyes.currentStrokeDirY = 1;
+                        g_companionEyes.strokeAccumY = 0.0f;
+                    }
+                    g_companionEyes.strokeAccumY += mouseDeltaY;
+                } else if (mouseDeltaY < -1.0f) {
+                    if (g_companionEyes.currentStrokeDirY > 0 && g_companionEyes.strokeAccumY > kMinStroke) {
+                        g_companionEyes.shakeReversalCountY++;
+                        g_companionEyes.lastReversalTimeY = now;
+                        g_companionEyes.strokeAccumY = 0.0f;
+                        g_companionEyes.currentStrokeDirY = -1;
+                    } else if (g_companionEyes.currentStrokeDirY >= 0) {
+                        g_companionEyes.currentStrokeDirY = -1;
+                        g_companionEyes.strokeAccumY = 0.0f;
+                    }
+                    g_companionEyes.strokeAccumY += mouseDeltaY;
+                }
+
+                // 8 rapid reversals along either X or Y (4 full back-and-forth shake cycles) triggers Dizzy!
+                if (g_companionEyes.shakeReversalCountX >= 8 || g_companionEyes.shakeReversalCountY >= 8) {
+                    g_companionEyes.dizzyEndTime = now + 1.8; // Dizzy for 1.8 seconds
+                    g_companionEyes.dizzyCooldownUntil = now + 3.5; // Cooldown 3.5s before next shake
+                    g_companionEyes.shakeReversalCountX = 0;
+                    g_companionEyes.shakeReversalCountY = 0;
+                    g_companionEyes.strokeAccumX = 0.0f;
+                    g_companionEyes.strokeAccumY = 0.0f;
+                }
+            }
+        }
+
+        const bool isDizzy = (now < g_companionEyes.dizzyEndTime);
+        const bool isPlayingMusic = (state.media.available && state.media.playing);
+
+        // System Idle Check (Mouse + Keyboard):
+        LASTINPUTINFO lii = { sizeof(LASTINPUTINFO) };
+        DWORD idleMs = 0;
+        if (GetLastInputInfo(&lii)) {
+            idleMs = GetTickCount() - lii.dwTime;
+        }
+
+        // 2. Deep Sleep with Drool after 10s idle (STRICTLY DISABLED when music is playing!):
+        if (idleMs >= 10000 && !isPlayingMusic) {
+            if (!g_companionEyes.isDeepSleeping) {
+                g_companionEyes.isDeepSleeping = true;
+                g_companionEyes.sleepStartTime = now;
+            }
+        } else if (g_companionEyes.isDeepSleeping) {
+            // Awakened by input or music playback!
+            g_companionEyes.isDeepSleeping = false;
+            if (!isPlayingMusic) {
+                // If awakened by mouse/keyboard input: Shock -> Angry sequence
+                g_companionEyes.startledEndTime = now + 0.6; // 0.6s panic shock
+                g_companionEyes.angryEndTime = now + 0.6 + 2.5; // 2.5s angry eyebrows & glare
+                TriggerNudge();
+            }
+        }
+
+        const bool isDeepSleeping = g_companionEyes.isDeepSleeping && !isPlayingMusic;
+        const bool isStartled = (now < g_companionEyes.startledEndTime) && !isPlayingMusic;
+        const bool isAngry = (!isStartled && now < g_companionEyes.angryEndTime) && !isPlayingMusic;
+
+        // 3. Typing Peek check:
+        bool isTyping = false;
+        if (idleMs < 650 && fabsf(mouseDeltaX) < 2.0f && fabsf(mouseDeltaY) < 2.0f && !hover && !isDeepSleeping && !isStartled && !isAngry) {
+            g_companionEyes.lastTypingTime = now;
+        }
+        isTyping = (now - g_companionEyes.lastTypingTime < 0.95);
+
+        // 4. Sleepy Mode check (late night >= 23:00 / < 06:00, or battery <= 20%):
+        SYSTEMTIME st = {};
+        GetLocalTime(&st);
+        const bool isNight = (st.wHour >= 23 || st.wHour < 6);
+        const bool isLowBattery = (!state.battery.charging && state.battery.percent > 0 && state.battery.percent <= 20);
+        const bool isSleepy = !isPlayingMusic && !isDeepSleeping && (isNight || isLowBattery) && !hover && !isTyping && !isDizzy && !isStartled && !isAngry && (fabsf(dx) > 160.0f * scale || dy > 120.0f * scale);
+
+        // Wake surprise transition
+        if (g_companionEyes.wasSleepy && (hover || fabsf(dx) < 70.0f * scale)) {
+            g_companionEyes.wakeSurpriseStartTime = now;
+            g_companionEyes.wasSleepy = false;
+        }
+        if (isSleepy) {
+            g_companionEyes.wasSleepy = true;
+        }
+
+        const bool isSurprised = (now - g_companionEyes.wakeSurpriseStartTime < 0.65);
+
+        // 5. Happy Charging trigger:
+        if (state.battery.charging && !g_companionEyes.prevCharging) {
+            g_companionEyes.happyChargingEndTime = now + 2.2;
+        }
+        g_companionEyes.prevCharging = state.battery.charging;
+        const bool isHappyCharging = (now < g_companionEyes.happyChargingEndTime) && !isDeepSleeping;
+
+        // Calculate Look Target
+        float targetLookX = Clamp(dx / 320.0f, -1.0f, 1.0f);
+        float targetLookY = Clamp(dy / 220.0f, -1.0f, 1.0f);
+
+        if (isTyping) {
+            targetLookY = 0.88f; // Gaze down towards keyboard
+            targetLookX *= 0.35f;
+        } else if (isAngry) {
+            targetLookX = Clamp(dx / 180.0f, -1.0f, 1.0f); // Glare intensely at cursor
+            targetLookY = Clamp(dy / 140.0f, -1.0f, 1.0f);
+        }
+
+        // Frame-rate independent exponential smoothing for buttery-smooth tracking at 60Hz - 360Hz+:
+        float dt = static_cast<float>(mouseDt);
+        if (dt < 0.0005f || dt > 0.1f) dt = 0.016f;
+        const float smoothFactor = 1.0f - expf(-18.0f * dt);
+
+        g_companionEyes.lookX += (targetLookX - g_companionEyes.lookX) * smoothFactor;
+        g_companionEyes.lookY += (targetLookY - g_companionEyes.lookY) * smoothFactor;
+
+        const float maxOffsetX = 5.0f * scale;
+        const float maxOffsetY = 3.5f * scale;
+        float pupilX = g_companionEyes.lookX * maxOffsetX;
+        float pupilY = g_companionEyes.lookY * maxOffsetY;
+
+        // Dizzy Roll pupil swirl:
+        if (isDizzy && !isDeepSleeping && !isStartled && !isAngry) {
+            const float dizzyRemain = std::clamp(static_cast<float>(g_companionEyes.dizzyEndTime - now) / 1.8f, 0.0f, 1.0f);
+            const float dizzyPhase = static_cast<float>(now * 9.5);
+            pupilX = cosf(dizzyPhase) * 3.6f * scale * dizzyRemain;
+            pupilY = sinf(dizzyPhase * 0.85f) * 2.4f * scale * dizzyRemain;
+        } else if (isStartled) {
+            pupilX += sinf(static_cast<float>(now * 52.0)) * 1.8f * scale;
+            pupilY += cosf(static_cast<float>(now * 47.0)) * 1.5f * scale;
+        }
+
+        // Natural Blinking:
+        if (g_companionEyes.nextBlinkTime <= 0.0) {
+            g_companionEyes.nextBlinkTime = now + 3.0;
+        }
+        if (now >= g_companionEyes.nextBlinkTime) {
+            g_companionEyes.blinkStartTime = now;
+            g_companionEyes.nextBlinkTime = now + (isSleepy ? 2.0 : 3.2) + static_cast<double>(rand() % 220) / 100.0;
+        }
+
+        float blinkRatio = 1.0f;
+        const double blinkElapsed = now - g_companionEyes.blinkStartTime;
+        const double blinkDuration = isSleepy ? 0.40 : 0.18;
+        if (blinkElapsed >= 0.0 && blinkElapsed < blinkDuration && !isDeepSleeping) {
+            const float t = static_cast<float>(blinkElapsed / blinkDuration);
+            blinkRatio = 0.5f + 0.5f * cosf(t * 6.2831853f); // 1 -> 0 -> 1
+        }
+
+        // Hover Interaction:
+        const float targetHoverHappy = hover ? 1.0f : 0.0f;
+        g_companionEyes.hoverHappy += (targetHoverHappy - g_companionEyes.hoverHappy) * 0.15f;
+
+        // Music beat bounce & head-bobbing:
+        float leftBobY = 0.0f;
+        float rightBobY = 0.0f;
+        if (state.media.available && state.media.playing && !isDeepSleeping) {
+            const float groovePhase = static_cast<float>(now * 6.2831853 * 1.85); // rhythmic beat ~110 bpm
+            leftBobY = sinf(groovePhase) * 2.0f * scale;
+            rightBobY = sinf(groovePhase + 0.35f) * 2.0f * scale; // alternating sway
+        }
+
+        // Deep sleep snoring breathing cycle:
+        float snorePhase = 0.0f;
+        if (isDeepSleeping) {
+            snorePhase = sinf(static_cast<float>((now - g_companionEyes.sleepStartTime) * 2.2));
+            leftBobY = snorePhase * 1.2f * scale;
+            rightBobY = snorePhase * 1.2f * scale;
+        } else if (isSleepy) {
+            const float drowsyNod = sinf(static_cast<float>(now * 1.5)) * 1.4f * scale;
+            leftBobY += drowsyNod;
+            rightBobY += drowsyNod;
+        }
+
+        // Base Eye geometry:
+        float baseEyeW = 7.5f * scale;
+        float baseEyeH = 13.0f * scale;
+        const float eyeSpacing = 18.0f * scale;
+
+        if (isDeepSleeping) {
+            baseEyeH = 0.0f; // Peaceful sleeping closed eyelid
+        } else if (isDizzy) {
+            baseEyeW *= 1.25f; // Wide, expressive reeling dizzy eyes
+            baseEyeH *= 1.15f;
+        } else if (isStartled) {
+            baseEyeW *= 1.45f; // Shocked wide open
+            baseEyeH *= 1.45f;
+        } else if (isAngry) {
+            baseEyeH *= 0.65f; // Slanted, narrowed glare
+            baseEyeW *= 1.08f;
+        } else if (isSleepy) {
+            baseEyeH *= 0.36f; // Droopy half-closed eyelids
+            baseEyeW *= 1.05f;
+        } else if (isSurprised) {
+            const float surpT = static_cast<float>(now - g_companionEyes.wakeSurpriseStartTime) / 0.65f;
+            const float surpScale = 1.0f + 0.32f * sinf(surpT * 3.14159f);
+            baseEyeW *= surpScale;
+            baseEyeH *= surpScale;
+        } else {
+            baseEyeW *= (1.0f + 0.12f * g_companionEyes.hoverHappy);
+            baseEyeH *= (1.0f + 0.12f * g_companionEyes.hoverHappy);
+        }
+
+        if (isTyping) {
+            baseEyeH *= 0.90f;
+            baseEyeW *= 1.05f;
+        }
+
+        const bool forceHappyCrescent = isHappyCharging;
+
+        // Draw Left (0) and Right (1) eyes
+        for (int eye = 0; eye < 2; ++eye) {
+            const bool isLeft = (eye == 0);
+            const float eyeCenterX = cx + (isLeft ? -eyeSpacing : eyeSpacing) + (isDeepSleeping ? 0.0f : pupilX);
+            const float eyeCenterY = cy + (isDeepSleeping ? 0.0f : pupilY) + (isLeft ? leftBobY : rightBobY);
+
+            float currentH = baseEyeH * blinkRatio;
+
+            // 1. Dizzy Expression: Hypnotic Spinning Archimedean Spirals (@ @)
+            if (isDizzy && !isDeepSleeping && !forceHappyCrescent) {
+                EnsureRoundJoinStyle();
+
+                // Luminous dizzy aura bloom around eye
+                if (ID2D1SolidColorBrush* dizzyAura3 = AcquireBrush(D2D1::ColorF(0.30f, 0.60f, 1.0f, 0.28f * settingsOpacity_))) {
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW + 9.0f * scale, currentH + 9.0f * scale), dizzyAura3);
+                }
+                if (ID2D1SolidColorBrush* dizzyAura2 = AcquireBrush(D2D1::ColorF(0.45f, 0.75f, 1.0f, 0.45f * settingsOpacity_))) {
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW + 4.5f * scale, currentH + 4.5f * scale), dizzyAura2);
+                }
+
+                // Dark eye backdrop for high contrast spiral
+                if (ID2D1SolidColorBrush* darkBackdrop = AcquireBrush(D2D1::ColorF(0.02f, 0.05f, 0.10f, 0.95f * settingsOpacity_))) {
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW, currentH), darkBackdrop);
+                }
+
+                // Outer eye rim
+                if (ID2D1SolidColorBrush* rimBrush = AcquireBrush(D2D1::ColorF(0.20f, 0.70f, 1.0f, 0.90f * settingsOpacity_))) {
+                    target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW, currentH), rimBrush, 1.4f * scale);
+                }
+
+                // Hypnotic Spinning Archimedean Spiral (@):
+                // Left eye rotates clockwise; right eye rotates counter-clockwise
+                const float spin = static_cast<float>(now * (isLeft ? 12.0 : -12.0));
+                ComPtr<ID2D1PathGeometry> spiralGeom;
+                if (SUCCEEDED(d2dFactory_->CreatePathGeometry(&spiralGeom))) {
+                    ComPtr<ID2D1GeometrySink> sink;
+                    if (SUCCEEDED(spiralGeom->Open(&sink))) {
+                        const float maxR = baseEyeW * 0.88f;
+                        const float hRatio = std::max(0.6f, currentH / std::max(1.0f, baseEyeW));
+                        const int kSteps = 28;
+                        sink->BeginFigure(D2D1::Point2F(eyeCenterX, eyeCenterY), D2D1_FIGURE_BEGIN_HOLLOW);
+                        for (int s = 1; s <= kSteps; ++s) {
+                            const float frac = static_cast<float>(s) / static_cast<float>(kSteps);
+                            const float theta = frac * (4.8f * 3.14159265f); // ~2.4 full turns
+                            const float r = frac * maxR;
+                            const float px = eyeCenterX + r * cosf(theta + spin);
+                            const float py = eyeCenterY + r * sinf(theta + spin) * hRatio;
+                            sink->AddLine(D2D1::Point2F(px, py));
+                        }
+                        sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                        sink->Close();
+
+                        if (ID2D1SolidColorBrush* spiralBrush = AcquireBrush(D2D1::ColorF(0.35f, 0.92f, 1.0f, 0.98f * settingsOpacity_))) {
+                            target_->DrawGeometry(spiralGeom.Get(), spiralBrush, 2.2f * scale, roundJoinStyle_.Get());
+                        }
+                    }
+                }
+
+                // Bright center core dot
+                if (ID2D1SolidColorBrush* dotBrush = AcquireBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.98f * settingsOpacity_))) {
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY), 2.0f * scale, 2.0f * scale), dotBrush);
+                }
+            } else if (forceHappyCrescent || isDeepSleeping || currentH < 2.0f * scale) {
+                // Closed eye (Deep Sleep, Blink, or Happy Charging Crescent):
+                D2D1_COLOR_F arcCol = isHappyCharging ? D2D1::ColorF(0.2f, 1.0f, 0.7f, 0.98f) : D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.95f);
+                if (ID2D1SolidColorBrush* lineBrush = AcquireBrush(arcCol)) {
+                    const float halfW = (isDeepSleeping ? 8.2f : baseEyeW * 1.15f) * (isDeepSleeping ? scale : 1.0f);
+                    ComPtr<ID2D1PathGeometry> arcGeom;
+                    if (SUCCEEDED(d2dFactory_->CreatePathGeometry(&arcGeom))) {
+                        ComPtr<ID2D1GeometrySink> sink;
+                        if (SUCCEEDED(arcGeom->Open(&sink))) {
+                            sink->BeginFigure(D2D1::Point2F(eyeCenterX - halfW, eyeCenterY), D2D1_FIGURE_BEGIN_HOLLOW);
+                            if (isDeepSleeping) {
+                                // Sleeping arc curving gently down
+                                sink->AddBezier(D2D1::BezierSegment(
+                                    D2D1::Point2F(eyeCenterX - halfW * 0.5f, eyeCenterY + 2.5f * scale),
+                                    D2D1::Point2F(eyeCenterX + halfW * 0.5f, eyeCenterY + 2.5f * scale),
+                                    D2D1::Point2F(eyeCenterX + halfW, eyeCenterY)));
+                            } else {
+                                // Happy crescent curving up
+                                sink->AddBezier(D2D1::BezierSegment(
+                                    D2D1::Point2F(eyeCenterX - halfW * 0.5f, eyeCenterY - 2.8f * scale),
+                                    D2D1::Point2F(eyeCenterX + halfW * 0.5f, eyeCenterY - 2.8f * scale),
+                                    D2D1::Point2F(eyeCenterX + halfW, eyeCenterY)));
+                            }
+                            sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                            sink->Close();
+
+                            // Soft glowing aura around crescent arcs
+                            if (ID2D1SolidColorBrush* arcGlow = AcquireBrush(isHappyCharging ? D2D1::ColorF(0.0f, 1.0f, 0.65f, 0.35f * settingsOpacity_)
+                                                                                            : D2D1::ColorF(0.15f, 0.78f, 1.0f, 0.30f * settingsOpacity_))) {
+                                target_->DrawGeometry(arcGeom.Get(), arcGlow, (isDeepSleeping ? 4.8f : 5.2f) * scale);
+                            }
+
+                            target_->DrawGeometry(arcGeom.Get(), lineBrush, (isDeepSleeping ? 2.2f : 2.5f) * scale);
+                        }
+                    }
+                }
+
+                // Animated Floating "Zzz" when in Deep Sleep (snoring dream effect):
+                if (isDeepSleeping && !isLeft) {
+                    EnsureRoundJoinStyle();
+                    const double sleepDuration = (now - g_companionEyes.sleepStartTime);
+
+                    for (int zIdx = 0; zIdx < 3; ++zIdx) {
+                        // Stagger the 3 Zs across time:
+                        const float cycleDuration = 2.4f;
+                        const float timeOffset = zIdx * 0.8f;
+                        const float progress = fmodf(static_cast<float>(sleepDuration + timeOffset), cycleDuration) / cycleDuration;
+
+                        // Float upwards and drift gently to the right in a soft wave
+                        const float driftX = (10.0f + 16.0f * progress + 3.0f * sinf(progress * 6.283f)) * scale;
+                        const float riseY = (2.0f + 20.0f * progress) * scale;
+                        const float zOriginX = eyeCenterX + driftX;
+                        const float zOriginY = eyeCenterY - riseY;
+
+                        // Size grows as it rises (small z near face -> bigger Z higher up)
+                        const float zW = (3.8f + 3.6f * progress) * scale;
+                        const float zH = (4.5f + 4.2f * progress) * scale;
+                        const float zStroke = (1.3f + 0.5f * progress) * scale;
+
+                        // Smooth alpha: quick fade in (first 20%), soft fade out (last 35%)
+                        float zAlpha = 1.0f;
+                        if (progress < 0.20f) {
+                            zAlpha = progress / 0.20f;
+                        } else if (progress > 0.65f) {
+                            zAlpha = (1.0f - progress) / 0.35f;
+                        }
+                        zAlpha = Clamp(zAlpha, 0.0f, 1.0f) * 0.90f * settingsOpacity_;
+
+                        if (zAlpha > 0.02f) {
+                            // Soft dreamy pastel cyan glow
+                            D2D1_COLOR_F zCol = D2D1::ColorF(0.40f, 0.82f, 1.0f, zAlpha);
+                            if (ID2D1SolidColorBrush* zBrush = AcquireBrush(zCol)) {
+                                ComPtr<ID2D1PathGeometry> zPath;
+                                if (SUCCEEDED(d2dFactory_->CreatePathGeometry(&zPath))) {
+                                    ComPtr<ID2D1GeometrySink> sink;
+                                    if (SUCCEEDED(zPath->Open(&sink))) {
+                                        sink->BeginFigure(D2D1::Point2F(zOriginX, zOriginY), D2D1_FIGURE_BEGIN_HOLLOW);
+                                        sink->AddLine(D2D1::Point2F(zOriginX + zW, zOriginY));
+                                        sink->AddLine(D2D1::Point2F(zOriginX, zOriginY + zH));
+                                        sink->AddLine(D2D1::Point2F(zOriginX + zW, zOriginY + zH));
+                                        sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                                        sink->Close();
+                                        target_->DrawGeometry(zPath.Get(), zBrush, zStroke, roundJoinStyle_.Get());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Open eye: Multi-layer luminous glowing oval with radiant aura
+                const float auraPulse = 1.0f + 0.08f * sinf(static_cast<float>(now * 2.8));
+
+                // Layer 4: Deep volumetric outer aura (vầng hào quang tỏa sáng rộng quanh mắt)
+                D2D1_COLOR_F auraFarCol;
+                if (isAngry) {
+                    auraFarCol = D2D1::ColorF(1.0f, 0.15f, 0.02f, 0.35f * settingsOpacity_);
+                } else if (isHappyCharging) {
+                    auraFarCol = D2D1::ColorF(0.0f, 1.0f, 0.60f, 0.32f * settingsOpacity_);
+                } else {
+                    auraFarCol = D2D1::ColorF(0.0f, 0.65f, 1.0f, 0.28f * settingsOpacity_);
+                }
+                if (ID2D1SolidColorBrush* auraFar = AcquireBrush(auraFarCol)) {
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      (baseEyeW + 12.0f * scale) * auraPulse,
+                                                      (currentH + 12.0f * scale) * auraPulse), auraFar);
+                }
+
+                // Layer 3: Mid luminous corona
+                D2D1_COLOR_F auraMidCol = isAngry ? D2D1::ColorF(1.0f, 0.35f, 0.08f, 0.48f * settingsOpacity_)
+                                                  : D2D1::ColorF(0.12f, 0.78f, 1.0f, 0.42f * settingsOpacity_);
+                if (ID2D1SolidColorBrush* auraMid = AcquireBrush(auraMidCol)) {
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW + 6.5f * scale, currentH + 6.5f * scale), auraMid);
+                }
+
+                // Layer 2: Inner intense corona
+                D2D1_COLOR_F auraNearCol = isAngry ? D2D1::ColorF(1.0f, 0.60f, 0.20f, 0.68f * settingsOpacity_)
+                                                   : D2D1::ColorF(0.35f, 0.88f, 1.0f, 0.65f * settingsOpacity_);
+                if (ID2D1SolidColorBrush* auraNear = AcquireBrush(auraNearCol)) {
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW + 2.8f * scale, currentH + 2.8f * scale), auraNear);
+                }
+
+                // Layer 1: Saturated Eye Body (màu sắc con mắt đậm đà sắc nét)
+                D2D1_COLOR_F bodyCol = isAngry ? D2D1::ColorF(1.0f, 0.25f, 0.05f, 0.98f * settingsOpacity_)
+                                               : D2D1::ColorF(0.06f, 0.65f, 0.98f, 0.98f * settingsOpacity_);
+                if (ID2D1SolidColorBrush* bodyBrush = AcquireBrush(bodyCol)) {
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW, currentH), bodyBrush);
+                }
+
+                // Eye Contour stroke: Sharp deep rim for high definition
+                D2D1_COLOR_F contourCol = isAngry ? D2D1::ColorF(0.90f, 0.10f, 0.0f, 0.95f * settingsOpacity_)
+                                                  : D2D1::ColorF(0.0f, 0.48f, 0.90f, 0.95f * settingsOpacity_);
+                if (ID2D1SolidColorBrush* contourBrush = AcquireBrush(contourCol)) {
+                    target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW, currentH), contourBrush, 1.3f * scale);
+                }
+
+                // Core: Brilliant luminous inner core
+                D2D1_COLOR_F coreCol = isAngry ? D2D1::ColorF(1.0f, 0.92f, 0.85f, 1.0f * settingsOpacity_)
+                                               : D2D1::ColorF(0.88f, 0.97f, 1.0f, 1.0f * settingsOpacity_);
+                if (ID2D1SolidColorBrush* core = AcquireBrush(coreCol)) {
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(eyeCenterX, eyeCenterY),
+                                                      baseEyeW * 0.72f, currentH * 0.72f), core);
+                }
+
+                // Specular reflection highlights (dual dots for lively, glassy eyes)
+                if (currentH > 4.5f * scale) {
+                    if (ID2D1SolidColorBrush* spec = AcquireBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.92f * settingsOpacity_))) {
+                        // Primary highlight (top-left)
+                        target_->FillEllipse(D2D1::Ellipse(
+                            D2D1::Point2F(eyeCenterX - baseEyeW * 0.28f, eyeCenterY - currentH * 0.30f),
+                            2.1f * scale, 2.3f * scale), spec);
+                        // Secondary mini highlight (bottom-right)
+                        target_->FillEllipse(D2D1::Ellipse(
+                            D2D1::Point2F(eyeCenterX + baseEyeW * 0.25f, eyeCenterY + currentH * 0.25f),
+                            1.1f * scale, 1.1f * scale), spec);
+                    }
+                }
+            }
+
+            // Compact, Sharp Angry Eyebrows (\ /) directly above each eye:
+            if (isAngry) {
+                D2D1_COLOR_F browCol = D2D1::ColorF(1.0f, 0.28f, 0.10f, 0.96f * settingsOpacity_);
+                if (ID2D1SolidColorBrush* browBrush = AcquireBrush(browCol)) {
+                    const float browStroke = 2.6f * scale;
+                    D2D1_POINT_2F pStart, pEnd;
+                    if (isLeft) {
+                        // Left brow slants down towards center \ (compact, exactly over eye)
+                        pStart = D2D1::Point2F(eyeCenterX - 9.0f * scale, eyeCenterY - currentH - 4.5f * scale);
+                        pEnd   = D2D1::Point2F(eyeCenterX + 7.5f * scale, eyeCenterY - currentH - 1.2f * scale);
+                    } else {
+                        // Right brow slants down towards center / (compact, exactly over eye)
+                        pStart = D2D1::Point2F(eyeCenterX - 7.5f * scale, eyeCenterY - currentH - 1.2f * scale);
+                        pEnd   = D2D1::Point2F(eyeCenterX + 9.0f * scale, eyeCenterY - currentH - 4.5f * scale);
+                    }
+
+                    target_->DrawLine(pStart, pEnd, browBrush, browStroke);
+                    // Rounded endcaps
+                    target_->FillEllipse(D2D1::Ellipse(pStart, browStroke * 0.5f, browStroke * 0.5f), browBrush);
+                    target_->FillEllipse(D2D1::Ellipse(pEnd, browStroke * 0.5f, browStroke * 0.5f), browBrush);
+                }
+            }
+        }
+
+        // Orbiting Dizzy Stars & Sparkles (💫) overhead when dizzy:
+        if (isDizzy && !isDeepSleeping) {
+            EnsureRoundJoinStyle();
+            for (int sIdx = 0; sIdx < 2; ++sIdx) {
+                const float starPhase = static_cast<float>(now * 4.6 + sIdx * 3.14159265);
+                const float starOrbitW = (eyeSpacing + 14.0f) * scale;
+                const float starOrbitH = 6.5f * scale;
+                const float starX = cx + cosf(starPhase) * starOrbitW;
+                const float starY = cy - 14.0f * scale + sinf(starPhase) * starOrbitH;
+                const float starR = (2.6f + 0.7f * sinf(starPhase * 2.0f)) * scale;
+
+                if (ID2D1SolidColorBrush* starBrush = AcquireBrush(D2D1::ColorF(1.0f, 0.88f, 0.25f, 0.92f * settingsOpacity_))) {
+                    target_->DrawLine(D2D1::Point2F(starX - starR, starY), D2D1::Point2F(starX + starR, starY), starBrush, 1.4f * scale, roundJoinStyle_.Get());
+                    target_->DrawLine(D2D1::Point2F(starX, starY - starR), D2D1::Point2F(starX, starY + starR), starBrush, 1.4f * scale, roundJoinStyle_.Get());
+                }
+            }
+        }
+    }
+
     void DrawIdleDashboard(const SharedState& state, D2D1_RECT_F rect, const Settings& settings,
                            double now) {
         if (settings.gameOverlay || g_gameOverlayPinned.load()) {
@@ -15417,13 +16280,18 @@ class Renderer {
 
         const float dashHeight = rect.bottom - rect.top;
         const float dashRadius = ContentIslandRadius(dashHeight);
-        ComPtr<ID2D1Geometry> dashMask = CreateIslandMaskGeometry(rect, dashRadius, g_settings.notchStyle);
+        const bool useNotchDash = g_settings.notchStyle || (g_settings.companionEyes && !IsBottomPosition(g_settings.position));
+        D2D1_RECT_F maskRect = rect;
+        if (g_companionEyes.isDeepSleeping) {
+            maskRect.bottom += 36.0f;
+        }
+        ComPtr<ID2D1Geometry> dashMask = CreateIslandMaskGeometry(maskRect, dashRadius, useNotchDash);
         ID2D1Layer* dashLayer = AcquireLayer();
         const bool haveDashMask = dashMask && dashLayer;
         if (haveDashMask) {
-            target_->PushLayer(D2D1::LayerParameters(rect, dashMask.Get(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE), dashLayer);
+            target_->PushLayer(D2D1::LayerParameters(maskRect, dashMask.Get(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE), dashLayer);
         } else {
-            target_->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            target_->PushAxisAlignedClip(maskRect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         }
 
         SYSTEMTIME local = {};
@@ -15456,21 +16324,24 @@ class Renderer {
             t = Clamp(t, 0.0f, 1.0f);
             return t * t * (3.0f - 2.0f * t);
         };
-        // Height-driven, like the media surface: collapsed content is gone by
-        // ~70px, expanded content starts at ~56px and is solid by ~120px.
-        const float collapsedAlpha = SmoothFade((70.0f - dashHeight) / 30.0f);
-        const float expandedAlpha = SmoothFade((dashHeight - 56.0f) / 64.0f);
+        // Separated thresholds: collapsed UI fades out completely by 52px,
+        // and expanded UI begins at 56px, eliminating any cross-bleeding between states.
+        const float collapsedAlpha = SmoothFade((52.0f - dashHeight) / 18.0f);
+        const float expandedAlpha = SmoothFade((dashHeight - 56.0f) / 60.0f);
 
         ID2D1Layer* dashFadeLayer = AcquireLayer();
 
         if (collapsedAlpha > 0.01f) {
             if (dashFadeLayer) {
-                target_->PushLayer(D2D1::LayerParameters(rect, nullptr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                target_->PushLayer(D2D1::LayerParameters(maskRect, nullptr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                                                           D2D1::IdentityMatrix(), collapsedAlpha, nullptr,
                                                           D2D1_LAYER_OPTIONS_NONE),
                                    dashFadeLayer);
             }
 
+            if (settings.companionEyes) {
+                DrawCompanionEyes(rect, settings, state, now, hover_);
+            } else {
             // Collapsed Mode (Apple Dynamic Island status bar).
             //
             // Slots are placed from the same measurements that sized the pill, so
@@ -15542,6 +16413,8 @@ class Renderer {
             }
             textBrush_->SetOpacity(1.0f);
 
+            } // end else companionEyes
+
             if (dashFadeLayer) {
                 target_->PopLayer();
             }
@@ -15562,6 +16435,7 @@ class Renderer {
             if (settings.weather) activeTabs.push_back(1);
             if (settings.hardwareMonitorModule) activeTabs.push_back(2);
             if (settings.fileTrayModule) activeTabs.push_back(4);
+            if (settings.clipboard) activeTabs.push_back(6);
 
             int maxTabs = static_cast<int>(activeTabs.size());
             int tabIdx = NormalizedTabIndex(settings);
@@ -15582,6 +16456,7 @@ class Renderer {
                 else if (activeTabId == 1) DrawWeatherDashboard(state, fullRect, settings, now, scale, hasWeather, wIcon, wText);
                 else if (activeTabId == 2) DrawHardwareMonitorDashboard(state, fullRect, settings, scale);
                 else if (activeTabId == 4) DrawFileTrayDashboard(state, fullRect, settings, scale);
+                else if (activeTabId == 6) DrawClipboardHistoryDashboard(state, fullRect, settings, scale);
             });
 
             DrawTabPagination(fullRect, maxTabs);
@@ -15889,16 +16764,17 @@ class Renderer {
             const float ad = Clamp(std::fabs(d), 0.0f, 1.0f);
             const float eased = SmoothStep01(ad);
 
-            const float alpha = std::pow(1.0f - eased, kFadePower);
+            // 1. Pure Apple-grade Cross-Dissolve:
+            // Outgoing tab fades away smoothly and cleanly before incoming tab emerges
+            const float alpha = std::pow(1.0f - eased, 2.8f);
             if (alpha <= 0.004f) {
                 return;
             }
 
-            const float scale = 1.0f - (1.0f - kMinScale) * eased;
-            const float dy = d * kTravelPx;
-
-            target_->SetTransform(D2D1::Matrix3x2F::Scale(scale, scale, center) *
-                                  D2D1::Matrix3x2F::Translation(0.0f, dy) * oldTransform);
+            // 2. Strict 1:1 Native Pixel Lock:
+            // Completely eliminated Matrix3x2F::Scale and Matrix3x2F::Translation(dy).
+            // Zero text bloating, font stretching, or blurred numbers during tab transitions.
+            target_->SetTransform(oldTransform);
             if (alpha < 0.995f && tabLayer_) {
                 target_->PushLayer(
                     D2D1::LayerParameters(rect, nullptr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
@@ -15990,7 +16866,8 @@ class Renderer {
     // stadium corner arc grew with the size scale until it cut across the album
     // art's top-left corner (visible from roughly 2x upwards).
     float ContentIslandRadius(float contentHeight) const {
-        if (g_settings.notchStyle) {
+        const bool useNotch = g_settings.notchStyle || (g_settings.companionEyes && !IsBottomPosition(g_settings.position));
+        if (useNotch) {
             return 16.0f;
         }
         if (g_settings.w11Style) {
@@ -16036,7 +16913,8 @@ class Renderer {
         PublishContentGeometry(rect, sideLyricsExtra);
 
         const float radius = ContentIslandRadius(height);
-        ComPtr<ID2D1Geometry> mask = CreateIslandMaskGeometry(rect, radius, settings.notchStyle);
+        const bool useNotchMedia = settings.notchStyle || (settings.companionEyes && !IsBottomPosition(settings.position));
+        ComPtr<ID2D1Geometry> mask = CreateIslandMaskGeometry(rect, radius, useNotchMedia);
         ID2D1Layer* layer = AcquireLayer();
 
         float expandedAlpha = std::clamp((height - MediaLayout::kExpandedMinHeight) / 60.0f, 0.0f, 1.0f);
@@ -16134,6 +17012,7 @@ class Renderer {
             if (settings.weather) activeTabs.push_back(2);
             if (settings.hardwareMonitorModule) activeTabs.push_back(3);
             if (settings.fileTrayModule) activeTabs.push_back(4);
+            if (settings.clipboard) activeTabs.push_back(6);
             if (settings.lyrics && !lyricsFirst) activeTabs.push_back(5);  // Lyrics (last)
 
             // Same settings object as the list above, so the index can't be
@@ -16182,7 +17061,7 @@ class Renderer {
                                                    rect.top + 20.0f + (artSize + waveH) * 0.5f);
 
                 const float textLeft = artRect.right + 18.0f;
-                const float textRight = waveRect.left - 16.0f;
+                const float textRight = settings.companionEyes ? (waveRect.left - 54.0f) : (waveRect.left - 16.0f);
 
                 // Title — bold, prominent.
                 D2D1_RECT_F titleRect = D2D1::RectF(textLeft, rect.top + 34.0f, textRight, rect.top + 54.0f);
@@ -16221,6 +17100,13 @@ class Renderer {
                         const float dotX = waveRect.left + i * (barWidth + gap) + barWidth * 0.5f;
                         target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, centerY), 1.2f, 1.2f), mutedBrush_.Get());
                     }
+                }
+
+                // Grooving Companion Eyes in expanded media view:
+                if (settings.companionEyes) {
+                    D2D1_RECT_F eyesExpandedRect = D2D1::RectF(waveRect.left - 48.0f, waveRect.top - 2.0f,
+                                                              waveRect.left - 8.0f, waveRect.bottom + 2.0f);
+                    DrawCompanionEyes(eyesExpandedRect, settings, state, now, hover_, 0.65f);
                 }
 
                 // Source line, under the artist (or under the album when there is one).
@@ -16383,6 +17269,8 @@ class Renderer {
                 DrawHardwareMonitorDashboard(state, rect, settings, 1.0f);
             } else if (activeTabId == 4) {
                 DrawFileTrayDashboard(state, rect, settings, 1.0f);
+            } else if (activeTabId == 6) {
+                DrawClipboardHistoryDashboard(state, rect, settings, 1.0f);
             } else if (activeTabId == 5) {
                 // Laid out at the final expanded size and pinned to the top, so growing
                 // the island only reveals the lyrics instead of sliding them around.
@@ -16429,8 +17317,17 @@ class Renderer {
                 shiftX = 22.0f;
             }
 
-            D2D1_RECT_F waveRect = D2D1::RectF(rect.right - 42.0f - shiftX, cy - 10.0f,
-                                               rect.right - 14.0f - shiftX, cy + 10.0f);
+            float eyesWidth = 0.0f;
+            D2D1_RECT_F eyesPillRect = {};
+            if (settings.companionEyes) {
+                eyesWidth = 32.0f;
+                eyesPillRect = D2D1::RectF(rect.right - 10.0f - eyesWidth - shiftX, cy - 14.0f,
+                                           rect.right - 10.0f - shiftX, cy + 14.0f);
+            }
+
+            const float waveOffsetRight = (eyesWidth > 0.0f) ? (10.0f + eyesWidth + 6.0f) : 14.0f;
+            D2D1_RECT_F waveRect = D2D1::RectF(rect.right - 28.0f - waveOffsetRight - shiftX, cy - 10.0f,
+                                               rect.right - waveOffsetRight - shiftX, cy + 10.0f);
             if (state.media.playing) {
                 DrawSpectrum(state, waveRect, settings, now);
             } else {
@@ -16443,6 +17340,11 @@ class Renderer {
                     const float dotX = waveRect.left + i * (barWidth + gap) + barWidth * 0.5f;
                     target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, cy), 1.2f, 1.2f), mutedBrush_.Get());
                 }
+            }
+
+            // Draw grooving Companion Eyes right beside the waveform/lyrics!
+            if (settings.companionEyes) {
+                DrawCompanionEyes(eyesPillRect, settings, state, now, hover_, 0.58f);
             }
 
             // Lyrics between the album art and the visualiser. Fades in as the
@@ -20698,8 +21600,9 @@ class Renderer {
         const float alpha = SmoothStep01((h - need * 0.55f) / (need * 0.45f));
         if (alpha <= 0.01f) return;  // island still too small; content fades in as it opens
 
+        const bool useNotchLookup = settings.notchStyle || (settings.companionEyes && !IsBottomPosition(settings.position));
         ComPtr<ID2D1Geometry> mask =
-            CreateIslandMaskGeometry(rect, ContentIslandRadius(h), settings.notchStyle);
+            CreateIslandMaskGeometry(rect, ContentIslandRadius(h), useNotchLookup);
         ID2D1Layer* layer = AcquireLayer();
         const bool masked = mask && layer;
         if (masked) {
@@ -20972,6 +21875,7 @@ class Renderer {
     double lyricsWaveformFadeTime_ = -1.0;
     double lyricsLastDrawn_ = -1.0;  // last frame the lyrics tab was painted
     float  hoverScale_ = 1.0f;       // pill scale set by Render(); gives the resting expanded size
+    bool   hover_ = false;
     float  islandSizeLastW_ = 0.0f;  // island resize tracking (see DrawMedia)
     float  islandSizeLastH_ = 0.0f;
     double islandSizeMovedAt_ = -1e9;
@@ -21167,6 +22071,9 @@ Activity ActivityForKind(IslandKind kind, const Settings& settings, const Shared
             if (settings.autoHideIdleSeconds == -1 && !state.system.micActive && !state.system.cameraActive) {
                 activity.width = 0.0f;
                 activity.height = 0.0f;
+            } else if (settings.companionEyes) {
+                activity.width = 185.0f;
+                activity.height = 42.0f;
             } else {
                 // Seed only. The real collapsed width is measured from the clock
                 // and weather strings by Renderer::MeasureIdleStrip and applied in
@@ -21266,8 +22173,26 @@ DWORD g_keyboardThreadId = 0;
 // thread, after checking the setting. Nothing is lost by only posting.
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
+        auto* kbd = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+        if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+            g_companionEyes.lastTypingTime = NowSeconds();
+            // Long-press Ctrl+C detection for Clipboard History
+            if (kbd->vkCode == 'C' && (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+                if (g_ctrlCDownTime.load() == 0.0) {
+                    g_ctrlCDownTime.store(NowSeconds());
+                    g_ctrlCHistoryTriggered.store(false);
+                    HWND fg = GetForegroundWindow();
+                    if (fg && fg != g_hwnd) {
+                        g_prevClipboardWindow = fg;
+                    }
+                }
+            }
+        }
         if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
-            auto* kbd = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+            if (kbd->vkCode == 'C' || kbd->vkCode == VK_CONTROL) {
+                g_ctrlCDownTime.store(0.0);
+                g_ctrlCHistoryTriggered.store(false);
+            }
             if (kbd->vkCode == VK_CAPITAL || kbd->vkCode == VK_NUMLOCK) {
                 const bool capsOn = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
                 const bool numOn = (GetKeyState(VK_NUMLOCK) & 0x0001) != 0;
@@ -21286,7 +22211,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 // hook exists solely to notice Caps Lock and Num Lock for the indicator pill;
 // with that module off it was still running for nothing.
 static bool CapsLockHookWanted() {
-    return g_settings.capsLock;
+    return g_settings.capsLock || g_settings.companionEyes || g_settings.clipboard;
 }
 
 // Wakes the keyboard thread so it re-evaluates whether the hook is needed.
@@ -21698,8 +22623,7 @@ void LoadFileTray() {
 }
 
 bool TrayModuleEnabled() {
-    std::lock_guard lock(g_settingsMutex);
-    return g_settings.fileTrayModule;
+    return true;
 }
 
 void AddPathsToFileTrayCore(const std::vector<std::wstring>& paths) {
@@ -21782,23 +22706,48 @@ bool ExtractDropPaths(IDataObject* data, std::vector<std::wstring>* out) {
     }
     FORMATETC fmt = {CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
     STGMEDIUM medium = {};
-    if (FAILED(data->GetData(&fmt, &medium))) {
-        return false;
+    if (SUCCEEDED(data->GetData(&fmt, &medium))) {
+        // An HDROP is just the HGLOBAL; DragQueryFile locks it itself.
+        HDROP drop = reinterpret_cast<HDROP>(medium.hGlobal);
+        const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        for (UINT i = 0; i < count; ++i) {
+            const UINT len = DragQueryFileW(drop, i, nullptr, 0);
+            if (len == 0) {
+                continue;
+            }
+            std::wstring path(len, L'\0');
+            DragQueryFileW(drop, i, path.data(), len + 1);
+            out->push_back(std::move(path));
+        }
+        ReleaseStgMedium(&medium);
+        if (!out->empty()) return true;
     }
 
-    // An HDROP is just the HGLOBAL; DragQueryFile locks it itself.
-    HDROP drop = reinterpret_cast<HDROP>(medium.hGlobal);
-    const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
-    for (UINT i = 0; i < count; ++i) {
-        const UINT len = DragQueryFileW(drop, i, nullptr, 0);
-        if (len == 0) {
-            continue;
+    // Fallback: Shell IDList Array (Explorer items)
+    static const CLIPFORMAT cfShellIdList = static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_SHELLIDLIST));
+    FORMATETC fmtIdList = {cfShellIdList, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    STGMEDIUM mediumIdList = {};
+    if (SUCCEEDED(data->GetData(&fmtIdList, &mediumIdList))) {
+        LPIDA pida = reinterpret_cast<LPIDA>(GlobalLock(mediumIdList.hGlobal));
+        if (pida) {
+            LPCITEMIDLIST pidlFolder = reinterpret_cast<LPCITEMIDLIST>(reinterpret_cast<BYTE*>(pida) + pida->aoffset[0]);
+            for (UINT i = 1; i <= pida->cidl; ++i) {
+                LPCITEMIDLIST pidlRel = reinterpret_cast<LPCITEMIDLIST>(reinterpret_cast<BYTE*>(pida) + pida->aoffset[i]);
+                PIDLIST_ABSOLUTE pidlFull = ILCombine(pidlFolder, pidlRel);
+                if (pidlFull) {
+                    wchar_t path[MAX_PATH] = {};
+                    if (SHGetPathFromIDListW(pidlFull, path)) {
+                        out->push_back(path);
+                    }
+                    ILFree(pidlFull);
+                }
+            }
+            GlobalUnlock(mediumIdList.hGlobal);
         }
-        std::wstring path(len, L'\0');
-        DragQueryFileW(drop, i, path.data(), len + 1);
-        out->push_back(std::move(path));
+        ReleaseStgMedium(&mediumIdList);
+        if (!out->empty()) return true;
     }
-    ReleaseStgMedium(&medium);
+
     return !out->empty();
 }
 
@@ -21931,19 +22880,18 @@ void PasteIntoFileTray(HWND hwnd) {
 }
 
 DWORD PickTrayDropEffect(DWORD allowed) {
-    // The tray only references files, so never ask the source to move them.
     if (allowed & DROPEFFECT_COPY) return DROPEFFECT_COPY;
     if (allowed & DROPEFFECT_LINK) return DROPEFFECT_LINK;
-    return DROPEFFECT_NONE;
+    if (allowed & DROPEFFECT_MOVE) return DROPEFFECT_COPY; // Accept as copy reference
+    return DROPEFFECT_COPY;
 }
 
-// For non-file drags (browser images / links / text). Nothing is ever deleted from
-// the source for these, so MOVE is harmless and some apps only offer it.
+// For non-file drags (browser images / links / text).
 DWORD PickTrayDropEffectAny(DWORD allowed) {
     if (allowed & DROPEFFECT_COPY) return DROPEFFECT_COPY;
     if (allowed & DROPEFFECT_LINK) return DROPEFFECT_LINK;
-    if (allowed & DROPEFFECT_MOVE) return DROPEFFECT_MOVE;
-    return DROPEFFECT_NONE;
+    if (allowed & DROPEFFECT_MOVE) return DROPEFFECT_COPY;
+    return DROPEFFECT_COPY;
 }
 
 // ── Non-Explorer drops (Brave / Chrome / Edge / Firefox ...) ─────────────────
@@ -21971,12 +22919,36 @@ bool TrayDataAcceptable(IDataObject* data, bool* realFiles) {
         *realFiles = true;
         return true;
     }
+    static const CLIPFORMAT cfShellIdList = static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_SHELLIDLIST));
+    fmt.cfFormat = cfShellIdList;
+    if (data->QueryGetData(&fmt) == S_OK) {
+        *realFiles = true;
+        return true;
+    }
     fmt.cfFormat = TrayFmtFileDescriptorW();      // images dragged out of a browser
     if (data->QueryGetData(&fmt) == S_OK) return true;
     fmt.cfFormat = TrayFmtInetUrlW();             // dragged links
     if (data->QueryGetData(&fmt) == S_OK) return true;
     fmt.cfFormat = CF_UNICODETEXT;                // dragged text selections
     if (data->QueryGetData(&fmt) == S_OK) return true;
+    fmt.cfFormat = CF_TEXT;
+    if (data->QueryGetData(&fmt) == S_OK) return true;
+
+    // Fallback: enumerate available formats from the IDataObject
+    ComPtr<IEnumFORMATETC> enumFmt;
+    if (SUCCEEDED(data->EnumFormatEtc(DATADIR_GET, enumFmt.GetAddressOf())) && enumFmt) {
+        FORMATETC f = {};
+        while (enumFmt->Next(1, &f, nullptr) == S_OK) {
+            if (f.cfFormat == CF_HDROP || f.cfFormat == cfShellIdList) {
+                *realFiles = true;
+                return true;
+            }
+            if (f.cfFormat == TrayFmtFileDescriptorW() || f.cfFormat == TrayFmtInetUrlW() ||
+                f.cfFormat == CF_UNICODETEXT || f.cfFormat == CF_TEXT) {
+                return true;
+            }
+        }
+    }
     return false;
 }
 
@@ -22231,6 +23203,7 @@ class TrayDropTarget final : public IDropTarget {
             if (tab >= 0) {
                 g_idleTab = tab;
             }
+            g_trayAutoPinned = true;
             g_clickExpanded = true;
             g_layoutDirty = true;
             TriggerNudge();
@@ -22336,10 +23309,39 @@ void StartFileTrayDrag(const std::wstring& path) {
     g_hoveredFileTrayAction = -1;
     g_layoutDirty = true;
 
-    // File was moved away by the target: its tray entry is now stale.
-    if (effect != DROPEFFECT_NONE && GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    // File was dropped or moved into target: remove from temporary shelf
+    if (effect != DROPEFFECT_NONE) {
         RemoveFileTrayItemByPath(path);
+        size_t remaining = 0;
+        {
+            std::lock_guard lock(g_stateMutex);
+            remaining = g_state.fileTrayItems.size();
+        }
+        if (remaining == 0) {
+            g_trayAutoPinned = false;
+            g_clickExpanded = false;
+            TriggerNudge();
+        }
     }
+}
+
+void SimulateCtrlV(HWND targetWnd) {
+    if (targetWnd && IsWindow(targetWnd)) {
+        SetForegroundWindow(targetWnd);
+        Sleep(25);
+    }
+    INPUT inputs[4] = {};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_CONTROL;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = 'V';
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = 'V';
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = VK_CONTROL;
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(4, inputs, sizeof(INPUT));
 }
 
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -22484,6 +23486,17 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
 
+        case WM_APP_OPEN_CLIPBOARD_HISTORY: {
+            const int tab = ClipboardHistoryTabIndex(GetSettingsCopy());
+            if (tab >= 0) {
+                g_idleTab = tab;
+            }
+            g_clickExpanded = true;
+            g_layoutDirty = true;
+            TriggerNudge();
+            return 0;
+        }
+
         case WM_DEVICECHANGE: {
             // DBT_DEVICEARRIVAL = 0x8000, DBT_DEVICEREMOVECOMPLETE = 0x8004
             if (wParam == 0x8000 || wParam == 0x8004) {
@@ -22548,7 +23561,14 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             // is clickable; everything else falls through to the windows below.
             if (g_pillClientRect.valid) {
                 const PillClientRect& r = g_pillClientRect;
-                if (pt.x < r.left || pt.x > r.right || pt.y < r.top || pt.y > r.bottom) {
+                const bool isDragging = (GetKeyState(VK_LBUTTON) & 0x8000) != 0;
+                int padX = 0;
+                int padY = 0;
+                if (isDragging && g_settings.fileTrayModule) {
+                    padX = static_cast<int>(120.0f * g_settings.sizeScale);
+                    padY = static_cast<int>(80.0f * g_settings.sizeScale);
+                }
+                if (pt.x < r.left - padX || pt.x > r.right + padX || pt.y < r.top - 20 || pt.y > r.bottom + padY) {
                     return HTTRANSPARENT;
                 }
                 return HTCLIENT;
@@ -22815,6 +23835,38 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_layoutDirty = true;
             }
 
+            // Clipboard History hover: row highlight plus bin button.
+            int clipHoverRow = -1;
+            int clipHoverAction = -1;
+            if (g_settings.clipboard && currentTab == ClipboardHistoryTabIndex(g_settings)) {
+                size_t clipCount = 0;
+                {
+                    std::lock_guard lock(g_stateMutex);
+                    clipCount = g_state.clipboardHistory.size();
+                }
+                const MediaContentPoint cp = MediaContentFromClient(xPos, yPos);
+                if (cp.valid) {
+                    if (clipCount > 0 && FileTrayClearHitTest(cp)) {
+                        clipHoverAction = -2;
+                    } else {
+                        const float listTop = FileTrayLayout::kListTop;
+                        const float rowH = 32.0f;
+                        const float rowGap = 6.0f;
+                        if (cp.y >= listTop && cp.x >= FileTrayLayout::kPadX && cp.x <= cp.width - FileTrayLayout::kPadX) {
+                            const int rIdx = static_cast<int>((cp.y - listTop) / (rowH + rowGap));
+                            const int capacity = std::max(1, static_cast<int>((cp.height - 16.0f - listTop + rowGap) / (rowH + rowGap)));
+                            if (rIdx >= 0 && rIdx < capacity) {
+                                clipHoverRow = rIdx;
+                            }
+                        }
+                    }
+                }
+            }
+            if (g_hoveredClipboardRow.exchange(clipHoverRow) != clipHoverRow ||
+                g_hoveredClipboardAction.exchange(clipHoverAction) != clipHoverAction) {
+                g_layoutDirty = true;
+            }
+
             // Pressed on a row and moved past the system drag threshold: pick the file up.
             if (s_trayPressActive) {
                 if (!(wParam & MK_LBUTTON)) {
@@ -22845,6 +23897,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_layoutDirty = true;
             }
             if (g_hoveredFileTrayAction.exchange(-1) != -1) {
+                g_layoutDirty = true;
+            }
+            if (g_hoveredClipboardRow.exchange(-1) != -1 || g_hoveredClipboardAction.exchange(-1) != -1) {
                 g_layoutDirty = true;
             }
             return 0;
@@ -23027,6 +24082,16 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         SaveFileTray();
                         g_hoveredFileTrayRow = -1;
                         g_hoveredFileTrayAction = -1;
+                        size_t remaining = 0;
+                        {
+                            std::lock_guard lock(g_stateMutex);
+                            remaining = g_state.fileTrayItems.size();
+                        }
+                        if (remaining == 0) {
+                            g_trayAutoPinned = false;
+                            g_clickExpanded = false;
+                            TriggerNudge();
+                        }
                         g_layoutDirty = true;
                         return 0;
                     }
@@ -23044,6 +24109,54 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     }
                     // A click on the empty shelf should not fall through to
                     // "focus the media app".
+                    return 0;
+                }
+
+                if (g_settings.clipboard && currentTab == ClipboardHistoryTabIndex(g_settings)) {
+                    if (cp.valid) {
+                        if (FileTrayClearHitTest(cp)) {
+                            {
+                                std::lock_guard lock(g_stateMutex);
+                                g_state.clipboardHistory.clear();
+                            }
+                            g_hoveredClipboardRow = -1;
+                            g_hoveredClipboardAction = -1;
+                            g_layoutDirty = true;
+                            return 0;
+                        }
+                        const float listTop = FileTrayLayout::kListTop;
+                        const float rowH = 32.0f;
+                        const float rowGap = 6.0f;
+                        if (cp.y >= listTop && cp.x >= FileTrayLayout::kPadX && cp.x <= cp.width - FileTrayLayout::kPadX) {
+                            const int rIdx = static_cast<int>((cp.y - listTop) / (rowH + rowGap));
+                            const int scrollOffset = g_clipboardScroll.load(std::memory_order_relaxed);
+                            const size_t index = static_cast<size_t>(scrollOffset + rIdx);
+
+                            ClipboardHistoryItem toPaste;
+                            bool havePaste = false;
+                            {
+                                std::lock_guard lock(g_stateMutex);
+                                if (index < g_state.clipboardHistory.size()) {
+                                    toPaste = g_state.clipboardHistory[index];
+                                    havePaste = true;
+                                }
+                            }
+                            if (havePaste) {
+                                if (!toPaste.isImage && !toPaste.fullText.empty()) {
+                                    CopyTextToClipboard(hwnd, toPaste.fullText);
+                                }
+                                g_clickExpanded = false;
+                                g_layoutDirty = true;
+                                TriggerNudge();
+
+                                HWND prev = g_prevClipboardWindow;
+                                if (prev && IsWindow(prev)) {
+                                    SimulateCtrlV(prev);
+                                }
+                                return 0;
+                            }
+                        }
+                    }
                     return 0;
                 }
 
@@ -23181,6 +24294,23 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
             }
 
+            if (g_settings.clipboard && NormalizedTabIndex(g_settings) == ClipboardHistoryTabIndex(g_settings)) {
+                size_t clipCount = 0;
+                {
+                    std::lock_guard lock(g_stateMutex);
+                    clipCount = g_state.clipboardHistory.size();
+                }
+                if (clipCount > 3) {
+                    const int dir = delta > 0 ? -1 : 1;
+                    int cur = g_clipboardScroll.load(std::memory_order_relaxed);
+                    int maxSc = static_cast<int>(clipCount) - 3;
+                    cur = ClampInt(cur + dir, 0, maxSc);
+                    g_clipboardScroll.store(cur);
+                    g_layoutDirty = true;
+                    return 0;
+                }
+            }
+
             // New gesture (pause, or direction change): forget the leftover.
             if (wheelNow - s_lastWheelEvent > 220 ||
                 (s_wheelAccum != 0 && ((delta > 0) != (s_wheelAccum > 0)))) {
@@ -23284,6 +24414,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 }
 
 DWORD WINAPI RenderThreadProc(void*) {
+    Wh_Log(L"RenderThreadProc ENTERED!");
     HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
     WNDCLASSEXW wc = {};
@@ -23299,8 +24430,10 @@ DWORD WINAPI RenderThreadProc(void*) {
         kWindowClass, L"Dynamic Island for Windows", WS_POPUP, 0, 0, 520, 140,
         nullptr, nullptr, wc.hInstance, nullptr);
 
+    Wh_Log(L"CreateWindowEx called, hwnd=%p, lastError=%lu", hwnd, GetLastError());
     if (!hwnd) {
-        Wh_Log(L"Failed to create Dynamic Island overlay window.");
+        DWORD err = GetLastError();
+        Wh_Log(L"Failed to create Dynamic Island overlay window. Error: %lu", err);
         if (SUCCEEDED(hrCo)) {
             CoUninitialize();
         }
@@ -23343,6 +24476,7 @@ DWORD WINAPI RenderThreadProc(void*) {
 
     Renderer renderer;
     if (!renderer.Initialize(hwnd)) {
+        Wh_Log(L"renderer.Initialize failed!");
         DestroyWindow(hwnd);
         g_hwnd = nullptr;
         if (SUCCEEDED(hrCo)) {
@@ -23350,6 +24484,7 @@ DWORD WINAPI RenderThreadProc(void*) {
         }
         return 0;
     }
+    Wh_Log(L"Renderer initialized successfully! Entering main render loop...");
 
     // Restore the File Tray from disk. Done here because the shell icons need the
     // COM apartment this thread already initialised.
@@ -23617,7 +24752,15 @@ DWORD WINAPI RenderThreadProc(void*) {
             secondary = ActivityForKind(kinds[1], g_settings, snapshot);
         }
 
-        const bool pinned = g_pinnedExpanded.load();
+        // Check long-press Ctrl+C (>= 350ms) to open Clipboard History
+        const double ctrlCDown = g_ctrlCDownTime.load();
+        if (ctrlCDown > 0.0 && !g_ctrlCHistoryTriggered.load() && (now - ctrlCDown >= 0.35)) {
+            g_ctrlCHistoryTriggered.store(true);
+            PostMessageW(hwnd, WM_APP_OPEN_CLIPBOARD_HISTORY, 0, 0);
+        }
+
+        const bool traySticky = g_trayAutoPinned.load() && !snapshot.fileTrayItems.empty();
+        const bool pinned = g_pinnedExpanded.load() || traySticky;
 
         if (primary.kind != previousPrimary) {
             if (primary.kind != IslandKind::Idle &&
@@ -23678,7 +24821,7 @@ DWORD WINAPI RenderThreadProc(void*) {
 
         bool needsRender = false;
 
-        if (!hover && g_clickExpanded.load()) {
+        if (!hover && g_clickExpanded.load() && !traySticky) {
             g_clickExpanded = false;
             needsRender = true;
         }
@@ -23724,6 +24867,9 @@ DWORD WINAPI RenderThreadProc(void*) {
         }
 
         bool isHoverExpanded = g_settings.expandOnHover ? hover : (hover && g_clickExpanded.load());
+        if (traySticky) {
+            isHoverExpanded = true;
+        }
         const bool gameMetricsPresent = primary.kind == IslandKind::Idle &&
             (g_settings.gameOverlay || g_gameOverlayPinned.load());
         if (gameMetricsPresent) {
@@ -23855,11 +25001,14 @@ DWORD WINAPI RenderThreadProc(void*) {
                 const float clockSection = g_settings.mediaPillClock
                     ? renderer.MeasureMediaPill(snapshot, g_settings).sectionWidth
                     : 0.0f;
+                const float eyeBonus = g_settings.companionEyes ? 38.0f : 0.0f;
                 if (CollapsedLyricsActive(snapshot, g_settings)) {
                     // Collapsed but carrying lyrics: wider pill, same height.
-                    primary.width = (kCollapsedLyricsWidth + clockSection) * g_settings.sizeScale;
+                    primary.width = (kCollapsedLyricsWidth + clockSection + eyeBonus) * g_settings.sizeScale;
                 } else if (g_settings.mediaPillClock) {
-                    primary.width = (MediaPillLayout::kBaseWidth + clockSection) * g_settings.sizeScale;
+                    primary.width = (MediaPillLayout::kBaseWidth + clockSection + eyeBonus) * g_settings.sizeScale;
+                } else if (g_settings.companionEyes) {
+                    primary.width = (MediaPillLayout::kBaseWidth + eyeBonus) * g_settings.sizeScale;
                 }
             }
         }
@@ -24109,7 +25258,8 @@ DWORD WINAPI RenderThreadProc(void*) {
             mediaAnimating || isTransientPill(primary.kind) ||
             (secondary && isTransientPill(secondary->kind)) ||
             (countdownBarsOn && (hasCountdownBar(primary.kind) ||
-                                 (secondary && hasCountdownBar(secondary->kind))));
+                                 (secondary && hasCountdownBar(secondary->kind)))) ||
+            (g_settings.companionEyes && !isHidden);
         if (continuousAnimation) {
             needsRender = true;
         }
@@ -24305,26 +25455,11 @@ DWORD WINAPI RenderThreadProc(void*) {
             std::fabs(volumeBarSpring.velocity) > 0.5f ||
             g_tabAnimating.load(std::memory_order_relaxed);
 
-        if (continuousAnimation && !springsAnimating) {
-            constexpr double kContinuousFrameMs = 1000.0 / 60.0;
-            targetFrameMs = std::max(targetFrameMs, kContinuousFrameMs);
-        }
+        // High refresh rate (60Hz to 360Hz/500Hz):
+        // Allow continuous animation (companion eyes gaze tracking, music head-bobbing, floating Zzz)
+        // to render at the native high refresh rate without throttling down to 60 FPS!
 
         // Keyed to actual animation, not to repainting.
-        //
-        // A single repaint does not need 1ms pacing -- it needs one frame, which the
-        // pacer delivers fine at the default resolution. Only things that draw a
-        // *sequence* of frames care: continuous content and spring motion.
-        //
-        // Keying it to needsRender was wrong twice over. Per frame it thrashed,
-        // because needsRender alternates when 60Hz content runs under a higher
-        // Target FPS. And with the hold added, any one-off repaint still took the
-        // resolution for the full hold -- including the metric tick, which fired
-        // every second, so a plain idle island requested and released it once a
-        // second and held it roughly half the time with nothing moving at all.
-        //
-        // continuousAnimation and springsAnimating are exactly the two cases that
-        // want precise frame spacing, so they drive it directly.
         if (continuousAnimation || springsAnimating) {
             lastAnimatingAt = now;
         }
@@ -24335,10 +25470,9 @@ DWORD WINAPI RenderThreadProc(void*) {
             // frame rate. A settled strip only needs to notice the cursor, so ~20Hz.
             WaitForSingleObject(g_stopEvent, (stripActive && !springsAnimating) ? 50 : 16);
             nextFrameTarget = std::chrono::steady_clock::now();
-        } else if (springsAnimating && g_settings.targetFps <= 0 && SUCCEEDED(DwmFlush())) {
-            // Auto FPS while the island is resizing: block until DWM's next
-            // composition so every frame lands exactly on a vsync. A timer drifts
-            // against the display's refresh and produces judder even at high fps.
+        } else if ((springsAnimating || continuousAnimation) && g_settings.targetFps <= 0 && SUCCEEDED(DwmFlush())) {
+            // Auto FPS while animating: block on DWM's composition vsync for ultra-smooth
+            // native refresh rate (up to 300Hz/360Hz+) with perfect frame pacing and zero judder.
             nextFrameTarget = std::chrono::steady_clock::now();
         } else {
             // When animating, achieve ultra-smooth target refresh rate (e.g. 144Hz, 240Hz, 360Hz+).
@@ -24348,13 +25482,12 @@ DWORD WINAPI RenderThreadProc(void*) {
             auto nowTime = std::chrono::steady_clock::now();
             if (nowTime < nextFrameTarget) {
                 double remainingMs = std::chrono::duration<double, std::milli>(nextFrameTarget - nowTime).count();
-                if (remainingMs >= 1.5) {
+                if (remainingMs >= 2.0) {
                     // Sleep for the bulk of the remaining time using OS event wait (zero CPU usage)
-                    WaitForSingleObject(g_stopEvent, static_cast<DWORD>(remainingMs - 0.5));
+                    WaitForSingleObject(g_stopEvent, static_cast<DWORD>(remainingMs - 1.0));
                 }
-                // Spinning only pays off for fast spring motion on high refresh rates.
-                // For 60Hz content a frame landing under 1ms late is invisible, so sleep only.
-                if (springsAnimating && targetFrameMs < 10.0) {
+                // Spinning only pays off for fast motion on high refresh rates.
+                if ((springsAnimating || continuousAnimation) && targetFrameMs < 10.0) {
                     while (std::chrono::steady_clock::now() < nextFrameTarget &&
                            WaitForSingleObject(g_stopEvent, 0) == WAIT_TIMEOUT) {
                         std::this_thread::yield();
@@ -24491,6 +25624,14 @@ void WhTool_ModUninit() {
     StopThreads();
     Wh_Log(L"Dynamic Island for Windows unloaded.");
 }
+
+void WhTool_WaitForRenderThread() {
+    if (g_renderThread) {
+        WaitForSingleObject(g_renderThread, INFINITE);
+    }
+}
+
+#ifndef STANDALONE_BUILD
 
 //////////////////////////////////////////////////////////////////////////////////
 // Windhawk tool mod implementation for mods which don't need to inject to other
@@ -24670,3 +25811,4 @@ void Wh_ModUninit() {
     WhTool_ModUninit();
     ExitProcess(0);
 }
+#endif // !STANDALONE_BUILD
